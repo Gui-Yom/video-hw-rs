@@ -171,9 +171,9 @@ impl<T: ?Sized> Drop for CuBox<T> {
 }
 
 /// No guarantees this is used correctly. Beware of pinning multiple times.
-pub struct CuPin<C: Deref<Target: ?Sized>>(C);
+pub struct CuPin<C: Deref>(C);
 
-impl<C: Deref<Target: ?Sized>> CuPin<C> {
+impl<C: Deref> CuPin<C> {
     pub fn new(data: C) -> CuResult<Self> {
         Self::new_flags(data, 0)
     }
@@ -195,7 +195,7 @@ impl<C: Deref<Target: ?Sized>> CuPin<C> {
     }
 }
 
-impl<C: Deref<Target: ?Sized>> Drop for CuPin<C> {
+impl<C: Deref> Drop for CuPin<C> {
     fn drop(&mut self) {
         self.drop_inner().unwrap()
     }
