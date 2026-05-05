@@ -6793,6 +6793,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "zensim-gpu"
+version = "0.0.1"
+dependencies = [
+ "bytemuck",
+ "cubecl",
+ "image",
+ "zensim",
+]
+
+[[package]]
 name = "zenwebp"
 version = "0.4.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"

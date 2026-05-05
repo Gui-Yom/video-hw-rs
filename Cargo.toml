@@ -26,6 +26,7 @@ members = [
     "crates/ssimulacra2-cuda-kernel",
     "crates/zensim-cuda",
     "crates/zensim-cuda-kernel",
+    "crates/zensim-gpu",
     "crates/turbo-metrics",
     "crates/turbo-metrics-cli",
     "crates/zen-metrics-cli",
@@ -94,6 +95,7 @@ widestring = "1"
 zune-core = { version = "0.4", default-features = false, features = ["std"] }
 zune-image = { version = "0.4", default-features = false }
 dssim-core = { version = "3.4", default-features = false }
+zensim = { version = "0.2.8" }
 
 # Profile specifically for building nvptx code
 [profile.release-nvptx]

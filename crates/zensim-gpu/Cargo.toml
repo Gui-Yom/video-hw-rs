@@ -1,0 +1,33 @@
+[package]
+name = "zensim-gpu"
+version = "0.0.1"
+description = "Multi-vendor GPU implementation of the zensim perceptual similarity feature extractor, via CubeCL"
+edition.workspace = true
+authors.workspace = true
+homepage.workspace = true
+repository.workspace = true
+license = "MIT"
+rust-version = "1.92"
+publish = false
+
+[features]
+default = ["cuda", "wgpu", "cpu", "fast-reduction"]
+cuda = ["cubecl/cuda"]
+wgpu = ["cubecl/wgpu"]
+hip  = ["cubecl/hip"]
+cpu  = ["cubecl/cpu"]
+# Use Atomic<u32>::fetch_max + per-block partials for the per-column
+# accumulators. Same backend reality as dssim-gpu / ssim2-gpu: works on
+# CUDA / DX12 / HIP; Metal silently no-ops Atomic<f32>::fetch_add. The
+# `fast-reduction` flag here only gates the f32 atomic-add fast path
+# for the per-feature scalar fold; the f64 sum precision is preserved
+# by host-side promotion on read-back.
+fast-reduction = []
+
+[dependencies]
+cubecl = { version = "0.10.0-pre.4", default-features = false, features = ["std"] }
+
+[dev-dependencies]
+zensim = { workspace = true }
+bytemuck = "1"
+image = { version = "0.25", default-features = false, features = ["png", "jpeg"] }
