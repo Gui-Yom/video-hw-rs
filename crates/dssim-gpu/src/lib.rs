@@ -73,8 +73,10 @@
 
 pub mod kernels;
 pub mod pipeline;
+pub mod pipeline_batch;
 
 pub use pipeline::Dssim;
+pub use pipeline_batch::DssimBatch;
 
 /// Number of pyramid scales — matches `dssim-core` and `dssim-cuda`.
 pub const NUM_SCALES: usize = 5;
