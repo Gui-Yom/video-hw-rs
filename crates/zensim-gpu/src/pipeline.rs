@@ -57,6 +57,14 @@ struct Scale {
     /// `padded_w == logical_w`.
     mirror_offsets: Option<cubecl::server::Handle>,
     pad_count: u32,
+
+    /// Offset (in f64 units) of this scale's partials within the big
+    /// shared `partials_f64` buffer. Layout per scale:
+    /// `[ch0 col0 .. col(padded_w-1) | ch1 .. | ch2 ..]` × 17 slots/col.
+    partials_f64_off: usize,
+    partials_max_off: usize,
+    partials_f64_per_ch: usize, // = padded_w * 17
+    partials_max_per_ch: usize, // = padded_w * 3
 }
 
 fn alloc_zeros_f32<R: Runtime>(client: &ComputeClient<R>, n: usize) -> cubecl::server::Handle {
@@ -67,7 +75,14 @@ fn alloc_zeros_u32<R: Runtime>(client: &ComputeClient<R>, n: usize) -> cubecl::s
 }
 
 impl Scale {
-    fn new<R: Runtime>(client: &ComputeClient<R>, logical_w: u32, padded_w: u32, h: u32) -> Self {
+    fn new<R: Runtime>(
+        client: &ComputeClient<R>,
+        logical_w: u32,
+        padded_w: u32,
+        h: u32,
+        partials_f64_off: usize,
+        partials_max_off: usize,
+    ) -> Self {
         let n = (padded_w as usize) * (h as usize);
         let alloc3 = || -> [cubecl::server::Handle; 3] {
             [
@@ -113,6 +128,10 @@ impl Scale {
             h_sigma12: alloc_zeros_f32(client, n),
             mirror_offsets,
             pad_count,
+            partials_f64_off,
+            partials_max_off,
+            partials_f64_per_ch: (padded_w as usize) * 17,
+            partials_max_per_ch: (padded_w as usize) * 3,
         }
     }
 }
@@ -134,6 +153,14 @@ pub struct Zensim<R: Runtime> {
 
     scales: Vec<Scale>,
 
+    /// Persistent partials buffers. Sized to fit all (scale, channel)
+    /// per-column slots. Avoids the per-channel alloc-then-read churn
+    /// that dominated the warm-path cost in the original pipeline.
+    partials_f64: cubecl::server::Handle,
+    partials_max: cubecl::server::Handle,
+    partials_f64_len: usize,
+    partials_max_len: usize,
+
     has_cached_reference: bool,
 }
 
@@ -151,14 +178,31 @@ impl<R: Runtime> Zensim<R> {
         let mut logical_w = width;
         let mut padded_w = simd_padded_width(width as usize) as u32;
         let mut h = height;
+        // Walk the pyramid plan twice: first pass to compute partials
+        // offsets (so each scale knows where its slot lives in the
+        // shared buffers), second pass to actually allocate.
+        let mut plan: Vec<(u32, u32, u32)> = Vec::with_capacity(SCALES);
         for _ in 0..SCALES {
             if logical_w < 8 || h < 8 {
                 break;
             }
-            scales.push(Scale::new(&client, logical_w, padded_w, h));
+            plan.push((logical_w, padded_w, h));
             logical_w = (logical_w + 1) / 2;
             padded_w /= 2;
             h = (h + 1) / 2;
+        }
+        let mut partials_f64_total: usize = 0;
+        let mut partials_max_total: usize = 0;
+        for &(_, pw, _) in &plan {
+            partials_f64_total += (pw as usize) * 17 * 3;
+            partials_max_total += (pw as usize) * 3 * 3;
+        }
+        let mut f64_off: usize = 0;
+        let mut max_off: usize = 0;
+        for &(lw, pw, ph) in &plan {
+            scales.push(Scale::new(&client, lw, pw, ph, f64_off, max_off));
+            f64_off += (pw as usize) * 17 * 3;
+            max_off += (pw as usize) * 3 * 3;
         }
 
         // u8 staging is uploaded via host-side widening to u32 (WGSL
@@ -170,6 +214,13 @@ impl<R: Runtime> Zensim<R> {
         // Upload the 256-entry LUT once at construction.
         let srgb_lut = client.create_from_slice(f32::as_bytes(&crate::kernels::color::SRGB8_TO_LINEARF32_LUT));
 
+        // Persistent partials buffers. Zeroed via `vec![0.0; ...]`
+        // upload; each compute() call re-zeros via the dedicated
+        // `zero_partials` kernel before the per-(scale, channel)
+        // launches write into them.
+        let partials_f64 = client.create_from_slice(f64::as_bytes(&vec![0.0_f64; partials_f64_total]));
+        let partials_max = client.create_from_slice(f32::as_bytes(&vec![0.0_f32; partials_max_total]));
+
         Ok(Self {
             client,
             width,
@@ -179,6 +230,10 @@ impl<R: Runtime> Zensim<R> {
             src_u8_b,
             srgb_lut,
             scales,
+            partials_f64,
+            partials_max,
+            partials_f64_len: partials_f64_total,
+            partials_max_len: partials_max_total,
             has_cached_reference: false,
         })
     }
@@ -234,46 +289,80 @@ impl<R: Runtime> Zensim<R> {
         self.upload_u8(false, dist_srgb);
         self.run_xyb_pyramid(false);
 
-        // Per scale, per channel: H-blur + V-blur+features + read-back
-        // + host fold. Layout matches CPU `combine_scores`:
+        // No zeroing of `partials_*` — every column thread writes all
+        // its 17 f64 + 3 f32 slots in `fused_vblur_features_kernel`,
+        // so the previous call's contents are fully overwritten before
+        // any host fold reads them.
+
+        // Phase 1: launch every (scale, channel) H-blur + V-blur+features
+        // pair, writing into the shared partials buffer at unique slots.
+        // No host syncs in this loop — kernels pipeline asynchronously.
+        let n_scales = self.scales.len();
+        for s in 0..n_scales {
+            for ch in 0..3 {
+                self.launch_blur_and_features(s, ch);
+            }
+        }
+
+        // Phase 2: ONE read-back of the full partials buffers, after
+        // all kernels have been queued. cubecl serialises the read
+        // behind the kernels on the same client, so this single sync
+        // covers the whole pipeline.
+        let f64_bytes = self
+            .client
+            .read_one(self.partials_f64.clone())
+            .expect("read partials_f64");
+        let max_bytes = self
+            .client
+            .read_one(self.partials_max.clone())
+            .expect("read partials_max");
+        let parts_all = f64::from_bytes(&f64_bytes);
+        let maxs_all = f32::from_bytes(&max_bytes);
+
+        // Phase 3: host-side fold per (scale, channel). Layout matches
+        // CPU `combine_scores`:
         //   pass 1 (basic 13×3×scales): mean/L2/L4 pooled features
         //   pass 2 (peaks 6×3×scales): max + L8-pooled
         let mut out = [0.0_f64; TOTAL_FEATURES];
-        let n_scales = self.scales.len();
         let basic_total = n_scales * FEATURES_PER_CHANNEL_BASIC * 3;
 
         for s in 0..n_scales {
             for ch in 0..3 {
-                let (sums, peaks) = self.run_blur_and_features(s, ch);
+                let (sums, peaks) = self.fold_partials(s, ch, parts_all, maxs_all);
 
                 let pad_w = self.scales[s].padded_w as usize;
                 let h = self.scales[s].h as usize;
                 let inv_n = 1.0_f64 / (pad_w as f64 * h as f64);
-                // Threshold a f32-noise floor before dividing — CPU's
-                // SIMD path produces *exact* zero for constant inputs
-                // (e.g. the B channel of a grayscale image where every
-                // pixel has the same value), while GPU f32 ops on the
-                // same data leave a `~1e-14` per-pixel residue from
-                // mul-add fusion order differences. Without this floor,
-                // `sums[11] / sums[10]` blows up to 1e10+ for those
-                // channels, dominating the weighted feature distance.
-                // CPU's `safe_ratio` uses `den.abs() > 0.0` (any non-
-                // zero passes); we relax to a per-pixel-variance floor
-                // of 1e-10, well below any real HF energy and far above
-                // f32 cancellation noise. Real-image HF energies are
-                // typically 1e-3 to 1e0 per pixel, so the floor is
-                // never tripped on actual content.
-                const HF_NOISE_FLOOR: f64 = 1e-10;
-                let n = pad_w as f64 * h as f64;
-                let safe_ratio = |num: f64, den: f64| -> f64 {
-                    if den.abs() > HF_NOISE_FLOOR * n {
-                        num / den
-                    } else {
-                        0.0
-                    }
+                // CPU's HF feature extraction (zensim/src/streaming.rs)
+                // computes `var_src = sums[10] / N` and treats variances
+                // ≤ 1e-10 as zero:
+                //     hf_energy_gain = if var_src > 1e-10 { … } else { 0.0 };
+                //     hf_energy_loss = if var_src > 1e-10 { … } else { 0.0 };
+                //     hf_mag_loss    = if mad_src > 1e-10 { … } else { 0.0 };
+                // Mirror the per-pixel threshold exactly so a constant-X
+                // grayscale (where the SIMD sums round to ~ULP-noise on
+                // both CPU and GPU) folds to the same zero feature on
+                // both sides.
+                let var_src = sums[10] * inv_n;
+                let mad_src = sums[12] * inv_n;
+                // CPU returns the FEATURE directly (already with `(1 - …)`
+                // / `(… - 1)` / `.max(0)` applied) when the denominator
+                // is below threshold — NOT a 0 ratio that the caller
+                // then re-applies the `(1 - ratio).max(0)` to. Without
+                // matching this exactly, constant-input cases (black-vs-
+                // white at all 3 channels × 4 scales) emit
+                // `hf_energy_loss = 1.0` instead of `0.0`.
+                let (hf_energy_loss, hf_energy_gain) = if var_src > 1e-10 {
+                    let r = sums[11] / sums[10];
+                    ((1.0 - r).max(0.0), (r - 1.0).max(0.0))
+                } else {
+                    (0.0, 0.0)
                 };
-                let ratio_l2 = safe_ratio(sums[11], sums[10]);
-                let ratio_l1 = safe_ratio(sums[13], sums[12]);
+                let hf_mag_loss = if mad_src > 1e-10 {
+                    (1.0 - sums[13] / sums[12]).max(0.0)
+                } else {
+                    0.0
+                };
 
                 // Basic block: 13 features per channel, scales-major,
                 // channel-minor.
@@ -288,9 +377,9 @@ impl<R: Runtime> Zensim<R> {
                 out[bb + 7] = (sums[7] * inv_n).max(0.0).powf(0.25);
                 out[bb + 8] = (sums[8] * inv_n).max(0.0).sqrt();
                 out[bb + 9] = sums[9] * inv_n;
-                out[bb + 10] = (1.0 - ratio_l2).max(0.0);
-                out[bb + 11] = (1.0 - ratio_l1).max(0.0);
-                out[bb + 12] = (ratio_l2 - 1.0).max(0.0);
+                out[bb + 10] = hf_energy_loss;
+                out[bb + 11] = hf_mag_loss;
+                out[bb + 12] = hf_energy_gain;
 
                 // Peaks block: 6 features per channel.
                 let pb = basic_total
@@ -348,7 +437,11 @@ impl<R: Runtime> Zensim<R> {
         let s0 = &self.scales[0];
         let src = if is_a { &self.src_u8_a } else { &self.src_u8_b };
         let xyb = if is_a { &s0.ref_xyb } else { &s0.dis_xyb };
-        // sRGB → XYB at scale 0.
+        // sRGB → XYB at scale 0. `absorbance_bias_neg = -cbrtf_fast(K_B0)`
+        // is precomputed host-side using the same `cbrtf_fast` algorithm
+        // CPU zensim uses; the kernel takes it as a scalar so the bit-
+        // cast inside cbrtf_fast is never asked to operate on a literal.
+        let absorbance_bias_neg = -color::cbrtf_fast_host(color::K_B0);
         unsafe {
             color::srgb_to_positive_xyb_kernel::launch_unchecked::<R>(
                 &self.client,
@@ -362,6 +455,7 @@ impl<R: Runtime> Zensim<R> {
                 self.width,
                 self.height,
                 s0.padded_w,
+                absorbance_bias_neg,
             );
         }
         // Mirror-pad scale 0 (3 channels).
@@ -406,10 +500,10 @@ impl<R: Runtime> Zensim<R> {
         }
     }
 
-    /// Run the H-blur + V-blur+features kernels for one (scale, channel)
-    /// pair, then read back the per-column partials and fold to 17 f64
-    /// + 3 f32. Returns the folded accumulator state.
-    fn run_blur_and_features(&mut self, scale: usize, channel: usize) -> ([f64; 17], [f32; 3]) {
+    /// Launch H-blur + V-blur+features for one (scale, channel) pair,
+    /// writing the per-column partials into the shared partials buffer
+    /// at this scale/channel's pre-assigned offset. No host syncs.
+    fn launch_blur_and_features(&self, scale: usize, channel: usize) {
         let s = &self.scales[scale];
         let pad_total = s.n_padded;
         let pad_w = s.padded_w as usize;
@@ -431,16 +525,12 @@ impl<R: Runtime> Zensim<R> {
             );
         }
 
-        // Reset per-column partials before the kernel writes its slots.
-        // (Safe even with no atomics — every slot is overwritten exactly
-        // once per launch — but reusing across (scale, channel) means
-        // we want a clean slate per call, AND the alloc API takes
-        // host-side bytes, so we write fresh zeros.)
-        let zero_f64 = vec![0.0_f64; pad_w * 17];
-        let zero_max = vec![0.0_f32; pad_w * 3];
-        let partials_f64 = self.client.create_from_slice(f64::as_bytes(&zero_f64));
-        let partials_max = self.client.create_from_slice(f32::as_bytes(&zero_max));
-
+        // The features kernel writes to a sub-slice of the shared
+        // partials buffer at offset `s.partials_f64_off + channel * pad_w * 17`.
+        // We pass the full handle and a `slot_offset` scalar so the
+        // kernel computes its destination per column.
+        let slot_off_f64 = (s.partials_f64_off + channel * s.partials_f64_per_ch) as u32;
+        let slot_off_max = (s.partials_max_off + channel * s.partials_max_per_ch) as u32;
         unsafe {
             features::fused_vblur_features_kernel::launch_unchecked::<R>(
                 &self.client,
@@ -452,36 +542,39 @@ impl<R: Runtime> Zensim<R> {
                 ArrayArg::from_raw_parts(s.h_sigma12.clone(), pad_total),
                 ArrayArg::from_raw_parts(s.ref_xyb[channel].clone(), pad_total),
                 ArrayArg::from_raw_parts(s.dis_xyb[channel].clone(), pad_total),
-                ArrayArg::from_raw_parts(partials_f64.clone(), pad_w * 17),
-                ArrayArg::from_raw_parts(partials_max.clone(), pad_w * 3),
+                ArrayArg::from_raw_parts(self.partials_f64.clone(), self.partials_f64_len),
+                ArrayArg::from_raw_parts(self.partials_max.clone(), self.partials_max_len),
                 s.padded_w,
                 s.h,
                 BLUR_RADIUS,
+                slot_off_f64,
+                slot_off_max,
             );
         }
+    }
 
-        // Read back partials and fold across columns. Values are
-        // already in f64 (sums) and f32 (maxes), so the host fold is
-        // a flat reduction.
-        let f64_bytes = self
-            .client
-            .read_one(partials_f64)
-            .expect("read partials_f64");
-        let max_bytes = self
-            .client
-            .read_one(partials_max)
-            .expect("read partials_max");
-        let parts = f64::from_bytes(&f64_bytes);
-        let maxs = f32::from_bytes(&max_bytes);
+    /// Host-side fold of one (scale, channel)'s partials. Operates on
+    /// the already-read-back full partials buffers.
+    fn fold_partials(
+        &self,
+        scale: usize,
+        channel: usize,
+        parts_all: &[f64],
+        maxs_all: &[f32],
+    ) -> ([f64; 17], [f32; 3]) {
+        let s = &self.scales[scale];
+        let pad_w = s.padded_w as usize;
+        let f64_base = s.partials_f64_off + channel * s.partials_f64_per_ch;
+        let max_base = s.partials_max_off + channel * s.partials_max_per_ch;
 
         let mut sums = [0.0_f64; 17];
         let mut peaks = [0.0_f32; 3];
         for col in 0..pad_w {
             for i in 0..17 {
-                sums[i] += parts[col * 17 + i];
+                sums[i] += parts_all[f64_base + col * 17 + i];
             }
             for i in 0..3 {
-                let v = maxs[col * 3 + i];
+                let v = maxs_all[max_base + col * 3 + i];
                 if v > peaks[i] {
                     peaks[i] = v;
                 }

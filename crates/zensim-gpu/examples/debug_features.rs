@@ -34,11 +34,25 @@ fn add_noise(data: &[u8], amount: i16) -> Vec<u8> {
     out
 }
 
+fn solid(w: usize, h: usize, r: u8, g: u8, b: u8) -> Vec<u8> {
+    let mut v = Vec::with_capacity(w * h * 3);
+    for _ in 0..w * h {
+        v.push(r);
+        v.push(g);
+        v.push(b);
+    }
+    v
+}
+
 fn main() {
+    let case = std::env::args().nth(1).unwrap_or_else(|| "noisy".into());
     let w = 64;
     let h = 64;
-    let r = gradient(w, h);
-    let d = add_noise(&r, 8);
+    let (r, d) = match case.as_str() {
+        "blackwhite" => (solid(w, h, 0, 0, 0), solid(w, h, 255, 255, 255)),
+        _ => (gradient(w, h), add_noise(&gradient(w, h), 8)),
+    };
+    eprintln!("case = {case}");
 
     // CPU features.
     let z_cpu = ZensimCpu::new(ZensimProfile::latest());
@@ -60,7 +74,7 @@ fn main() {
         &zensim::profile::WEIGHTS_PREVIEW_V0_2,
     );
 
-    println!("cpu score = {cpu_score:.4}, gpu score = {gpu_score:.4e}");
+    println!("cpu score = {cpu_score:.10}, gpu score = {gpu_score:.10}, abs diff = {:.4e}, rel = {:.4e}", (gpu_score - cpu_score).abs(), (gpu_score - cpu_score).abs() / cpu_score.abs().max(1.0));
     println!("{:>4} {:>14} {:>14} {:>10}", "i", "cpu", "gpu", "abs");
     let mut max_abs = 0.0f64;
     let mut max_idx = 0usize;
@@ -72,13 +86,13 @@ fn main() {
             max_abs = abs;
             max_idx = i;
         }
-        if abs > 0.01 {
-            println!("{i:>4} {cpu:>14.6} {gpu:>14.6e} {abs:>10.4e}");
+        if abs > 1e-6 {
+            println!("{i:>4} {cpu:>14.6e} {gpu:>14.6e} {abs:>10.4e}");
         }
     }
-    println!("\nworst feature: idx={max_idx}, abs={max_abs:.4e}");
+    println!("\nworst: idx={max_idx}, abs={max_abs:.4e}");
     println!(
-        "  cpu = {:.6}, gpu = {:.6e}",
+        "  cpu = {:.6e}, gpu = {:.6e}",
         cpu_features[max_idx], gpu_features[max_idx]
     );
 }

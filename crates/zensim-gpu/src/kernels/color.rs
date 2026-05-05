@@ -1,31 +1,58 @@
-//! sRGB packed-u8 → planar positive-XYB f32.
+//! sRGB packed-u8 → planar positive-XYB f32 — bit-exact match to CPU
+//! `zensim::color::srgb_to_positive_xyb_planar_inner`.
 //!
-//! Verbatim port of `zensim-cuda-kernel/src/color.rs`, which itself
-//! matches CPU zensim's `srgb_to_positive_xyb_planar_inner`. The Halley
-//! `cbrtf_fast` is preserved bit-for-bit so the GPU output matches the
-//! CPU scalar path within ~1 ULP (FMA contraction differences only).
-//!
-//! The 256-entry sRGB-byte → linear-f32 LUT is uploaded as an
-//! `Array<f32>` argument (cubecl 0.10's `#[cube]` body can't index
-//! a host-side `[f32; 256]` constant directly).
-//!
-//! Output is 3 planar f32 buffers at the **padded** width — pad
-//! columns `[width..padded_w)` are left untouched by this kernel and
-//! filled by the [`pad`](super::pad) kernel afterwards.
+//! Algorithm:
+//! 1. sRGB byte → linear f32 via 256-entry LUT (uploaded as
+//!    `Array<f32>` because cubecl 0.10 can't index a host-side
+//!    `[f32; 256]` constant from a `#[cube]` body).
+//! 2. Opsin matrix multiply via FMA chain `K * r + (K * g + (K * b + K_B0))`.
+//!    Matches CPU's `m00.mul_add(r, m01.mul_add(g, m02.mul_add(b, bias)))`
+//!    fusion order exactly. Clipped to ≥ 0.
+//! 3. Magic-constant Newton seed + **two** Halley iterations
+//!    (`y = y * (2x + y³) / (2y³ + x)`). Matches
+//!    `magetypes::cbrt_midp_unchecked` and `zensim::color::cbrtf_fast`
+//!    for any non-zero non-edge input — the matrix output is always
+//!    ≥ K_B0 ≈ 0.0038, so edge cases don't need handling.
+//! 4. XYB with `absorbance_bias = -cbrtf_fast(K_B0)`. The bias is
+//!    precomputed host-side (because invoking the bit-cast on the
+//!    K_B0 literal in `#[cube]` body trips cubecl-cuda's codegen) and
+//!    passed in as a runtime scalar.
+//! 5. Positive shift: X*14+0.42, Y+0.01, (B-Y)+0.55.
 
 use cubecl::prelude::*;
 
-// Matrix + bias constants, match zensim CPU exactly (color.rs).
-const K_M02: f32 = 0.078;
-const K_M00: f32 = 0.30;
-const K_M01: f32 = 1.0 - K_M02 - K_M00;
-const K_M12: f32 = 0.078;
-const K_M10: f32 = 0.23;
-const K_M11: f32 = 1.0 - K_M12 - K_M10;
-const K_M20: f32 = 0.243_422_69;
-const K_M21: f32 = 0.204_767_45;
-const K_M22: f32 = 1.0 - K_M20 - K_M21;
-const K_B0: f32 = 0.003_793_073_4;
+// Matrix + bias constants, match CPU zensim exactly.
+pub const K_M02: f32 = 0.078;
+pub const K_M00: f32 = 0.30;
+pub const K_M01: f32 = 1.0 - K_M02 - K_M00;
+pub const K_M12: f32 = 0.078;
+pub const K_M10: f32 = 0.23;
+pub const K_M11: f32 = 1.0 - K_M12 - K_M10;
+pub const K_M20: f32 = 0.243_422_69;
+pub const K_M21: f32 = 0.204_767_45;
+pub const K_M22: f32 = 1.0 - K_M20 - K_M21;
+pub const K_B0: f32 = 0.003_793_073_4;
+
+/// Host-side bit-exact port of CPU zensim's `cbrtf_fast`. Produces the
+/// magic-constant Newton seed via bit manipulation, then runs two
+/// Halley iterations using the same `mul_add` order as the CPU SIMD
+/// path (`magetypes::cbrt_midp_unchecked`). Used to precompute
+/// `absorbance_bias = -cbrtf_fast(K_B0)` so the kernel takes the bias
+/// as a runtime scalar instead of evaluating it on a constant literal.
+pub fn cbrtf_fast_host(x: f32) -> f32 {
+    if x == 0.0 {
+        return 0.0;
+    }
+    let ui = x.to_bits();
+    let hx = (ui & 0x7FFF_FFFF) / 3 + 709_958_130;
+    let ui_out = (ui & 0x8000_0000) | hx;
+    let mut t = f32::from_bits(ui_out);
+    let mut r = t * t * t;
+    t *= x.mul_add(2.0, r) / r.mul_add(2.0, x);
+    r = t * t * t;
+    t *= x.mul_add(2.0, r) / r.mul_add(2.0, x);
+    t
+}
 
 /// 256-entry sRGB byte → linear f32 LUT. The pipeline uploads this to
 /// GPU memory once and passes the handle to
@@ -66,33 +93,33 @@ pub const SRGB8_TO_LINEARF32_LUT: [f32; 256] = [
     0.93011117, 0.9386859, 0.9473069, 0.9559735, 0.9646866, 0.9734455, 0.98225087, 0.9911022, 1.0,
 ];
 
-/// `cbrt` substitute — `f32::powf(x, 1/3)`.
+/// In-kernel `cbrtf_fast`: magic-constant Newton seed via bit
+/// manipulation + two Halley iterations. Caller must guarantee `x` is
+/// strictly positive (no edge-case handling). Matches CPU
+/// `cbrtf_fast` / `magetypes::cbrt_midp_unchecked` bit-exactly modulo
+/// FMA contraction.
 ///
-/// CPU zensim uses a magic-constant Newton seed + 2 Halley iterations
-/// (`cbrtf_fast`), but the seed step requires `reinterpret_cast<u32>(K_B0)`
-/// which cubecl-cuda's codegen can't emit for a literal-folded
-/// constant. `powf(_, 1/3)` agrees with `cbrtf_fast` within a few f32
-/// ULPs across the unit range, well below the SSIM formula's
-/// normalisation. dssim-gpu uses the same substitution in its Lab
-/// conversion.
+/// `x` must be a runtime variable — the bit-cast `u32::reinterpret(x)`
+/// emits `reinterpret_cast<uint32 const&>` which fails when cubecl-cuda
+/// folds a literal float into the body. The caller passes `mixed0/1/2`
+/// (matrix-multiply outputs, all variables) so this is safe at use
+/// sites; the constant `cbrtf_fast(K_B0)` is precomputed on the host.
 #[cube]
-fn cbrtf_fast(x: f32) -> f32 {
-    if x == 0.0 {
-        f32::new(0.0)
-    } else {
-        f32::powf(x, 1.0 / 3.0)
-    }
+fn cbrtf_fast_runtime(x: f32) -> f32 {
+    let ui = u32::reinterpret(x);
+    let hx = (ui & 0x7FFF_FFFFu32) / 3u32 + 709_958_130u32;
+    let ui_out = (ui & 0x8000_0000u32) | hx;
+    let t0 = f32::reinterpret(ui_out);
+    let r0 = t0 * t0 * t0;
+    let t1 = t0 * (fma(2.0, x, r0) / fma(2.0, r0, x));
+    let r1 = t1 * t1 * t1;
+    t1 * (fma(2.0, x, r1) / fma(2.0, r1, x))
 }
 
 /// sRGB packed RGB u8 → 3 planar positive-XYB f32 buffers.
 ///
-/// Inputs are uploaded as `Array<u32>` for WGSL portability (no native
-/// u8 storage on Metal / wgpu). The 256-entry LUT is also passed as a
-/// device buffer.
-///
-/// Output planes are each `padded_w × height` long; this kernel only
-/// writes columns `[0..width)`. Padding columns are filled by
-/// [`super::pad`].
+/// `absorbance_bias_neg = -cbrtf_fast(K_B0)` is precomputed host-side
+/// and passed as a runtime scalar.
 #[cube(launch_unchecked)]
 pub fn srgb_to_positive_xyb_kernel(
     src: &Array<u32>,
@@ -103,6 +130,7 @@ pub fn srgb_to_positive_xyb_kernel(
     width: u32,
     height: u32,
     padded_w: u32,
+    absorbance_bias_neg: f32,
 ) {
     let idx = ABSOLUTE_POS;
     let total = (width * height) as usize;
@@ -119,22 +147,31 @@ pub fn srgb_to_positive_xyb_kernel(
     let g = lut[src[i3 + 1] as usize];
     let b = lut[src[i3 + 2] as usize];
 
-    let mixed0 = f32::max(K_M00 * r + K_M01 * g + K_M02 * b + K_B0, 0.0);
-    let mixed1 = f32::max(K_M10 * r + K_M11 * g + K_M12 * b + K_B0, 0.0);
-    let mixed2 = f32::max(K_M20 * r + K_M21 * g + K_M22 * b + K_B0, 0.0);
+    // Match CPU SIMD FMA fusion: `m00 * r + (m01 * g + (m02 * b + K_B0))`.
+    let inner0 = fma(K_M02, b, K_B0);
+    let m0g = fma(K_M01, g, inner0);
+    let mixed0 = f32::max(fma(K_M00, r, m0g), 0.0);
+    let inner1 = fma(K_M12, b, K_B0);
+    let m1g = fma(K_M11, g, inner1);
+    let mixed1 = f32::max(fma(K_M10, r, m1g), 0.0);
+    let inner2 = fma(K_M22, b, K_B0);
+    let m2g = fma(K_M21, g, inner2);
+    let mixed2 = f32::max(fma(K_M20, r, m2g), 0.0);
 
-    let absorbance_bias = -cbrtf_fast(K_B0);
-    let c0 = cbrtf_fast(mixed0) + absorbance_bias;
-    let c1 = cbrtf_fast(mixed1) + absorbance_bias;
-    let c2 = cbrtf_fast(mixed2);
+    let t0 = cbrtf_fast_runtime(mixed0);
+    let t1 = cbrtf_fast_runtime(mixed1);
+    let t2 = cbrtf_fast_runtime(mixed2);
+
+    let c0 = t0 + absorbance_bias_neg;
+    let c1 = t1 + absorbance_bias_neg;
 
     let x_val = 0.5 * (c0 - c1);
     let y_val = 0.5 * (c0 + c1);
-    let b_val = c2 - y_val;
 
-    let x_pos = x_val * 14.0 + 0.42;
+    // CPU's positive shift: x.mul_add(14, 0.42), y + 0.01, (t2 - y) + 0.55.
+    let x_pos = fma(x_val, 14.0, 0.42);
     let y_pos = y_val + 0.01;
-    let b_pos = b_val + 0.55;
+    let b_pos = (t2 - y_val) + 0.55;
 
     let out_idx = y * pw + x;
     x_out[out_idx] = x_pos;

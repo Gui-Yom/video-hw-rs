@@ -56,6 +56,8 @@ pub fn fused_vblur_features_kernel(
     width: u32, // padded_w
     height: u32,
     radius: u32,
+    slot_off_f64: u32,
+    slot_off_max: u32,
 ) {
     let x_pos = ABSOLUTE_POS;
     if x_pos >= (width as usize) {
@@ -124,15 +126,17 @@ pub fn fused_vblur_features_kernel(
         let dv = dst[off];
 
         // SSIMULACRA2-style SSIM (no C1, uses `1 - (mu1-mu2)²`).
-        // PTX FMA fusion may differ from CPU AVX-512 contraction at the
-        // ULP level — synthetic flat / grayscale inputs (where the X
-        // channel collapses to ~0) can amplify f32 precision drift in
-        // `denom_s`. Real images don't show this; corpus parity ≤ 2
-        // points vs CPU `zensim::Zensim::compute(...).score()`.
+        // FMA fusion order matches CPU `zensim::fused::fused_vblur_ssim_inner_v4`
+        // exactly:
+        //   num_m   = mu_diff * (-mu_diff) + 1
+        //   num_s   = 2 * (-mu1 * mu2 + s12) + C2
+        //   denom_s = -mu2 * mu2 + (-mu1 * mu1 + ssq) + C2
         let mu_diff = mu1 - mu2;
-        let num_m = -mu_diff * mu_diff + 1.0;
-        let num_s = 2.0 * (-mu1 * mu2 + s12) + C2;
-        let denom_s = -mu2 * mu2 + (-mu1 * mu1 + ssq) + C2;
+        let num_m = fma(mu_diff, -mu_diff, 1.0);
+        let inner_ns = fma(-mu1, mu2, s12);
+        let num_s = fma(2.0, inner_ns, C2);
+        let inner_ds_inner = fma(-mu1, mu1, ssq);
+        let denom_s = fma(-mu2, mu2, inner_ds_inner) + C2;
         let sd_raw = 1.0 - (num_m * num_s) / denom_s;
         let sd = if sd_raw > 0.0 { sd_raw } else { f32::new(0.0) };
         let sd2 = sd * sd;
@@ -206,7 +210,7 @@ pub fn fused_vblur_features_kernel(
         y += 1u32;
     }
 
-    let base = x_pos * 17;
+    let base = (slot_off_f64 as usize) + x_pos * 17;
     partials_f64[base] = a0;
     partials_f64[base + 1] = a1;
     partials_f64[base + 2] = a2;
@@ -224,7 +228,7 @@ pub fn fused_vblur_features_kernel(
     partials_f64[base + 14] = a14;
     partials_f64[base + 15] = a15;
     partials_f64[base + 16] = a16;
-    let mbase = x_pos * 3;
+    let mbase = (slot_off_max as usize) + x_pos * 3;
     partials_max[mbase] = peak0;
     partials_max[mbase + 1] = peak1;
     partials_max[mbase + 2] = peak2;

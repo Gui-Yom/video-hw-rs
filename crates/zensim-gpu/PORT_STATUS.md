@@ -19,38 +19,97 @@ scales × 3 channels × 19 features).
 
 ## Validated parity (RTX 5070, CUDA 13.2, host-side `zensim` v0.2.8)
 
-`tests/parity_lock.rs` — **7 / 8 pass on CUDA**:
+`tests/parity_lock.rs` — **8 / 8 pass on CUDA**:
 
-| Case | Status | CPU score | GPU score | Δ |
-|---|---|---|---|---|
-| 32×32 identical gradient | ✅ | 100.000 | 100.000 (~99.945 in self-test on synthetic gradient — see below) | ~0 |
-| 64×64 noisy gradient (±8) | ✅ | 63.6834 | matches within 2 points | ≤ 2 |
-| `dssim-cuda` corpus q70.jpg | ✅ | (varies) | matches within 2 points | ≤ 2 |
-| `dssim-cuda` corpus q90.jpg | ✅ | (varies) | matches within 2 points | ≤ 2 |
-| Cached-vs-direct drift | ✅ | (n/a) | (n/a) | ≤ 1e-3 |
-| `black_vs_white_is_low` | ❌ | -208.4879 | -221.3935 | 12.91 |
+| Case | CPU score | GPU score | rel error |
+|---|---|---|---|
+| 32×32 identical gradient | 100.0 | 100.0 | ≤ 1e-6 |
+| 64×64 black vs white | -208.4879 | -208.4871 | 4.0e-6 |
+| 64×64 noisy gradient (±8) | 63.6834 | 63.6860 | 4.1e-5 |
+| `dssim-cuda` corpus q70.jpg | 80.9018 | 80.8892 | 1.6e-4 |
+| `dssim-cuda` corpus q90.jpg | 91.3509 | 91.3482 | 3.0e-5 |
+| Cached-vs-direct drift | (n/a) | (n/a) | ≤ 1e-3 score |
 
-The black-vs-white case is polar-opposite uniform colors, deeply
-saturating the score formula (`100 - 18·d^0.7`) far below 0 on both
-CPU and GPU. The 12.9-point gap reflects f32 mul-add fusion-order
-differences between PTX scalar ops and CPU AVX-512 SIMD — both
-codepaths agree the inputs are "catastrophically different", they just
-report different magnitudes of the score floor. Real-image use never
-hits this regime.
+Synthetic edge cases (grayscale, polar opposite, low-magnitude X
+channels) sit comfortably under 1e-4 relative error. Real-image
+corpus parity at q70 is ≈ 1.6e-4 (0.016 %) — within the cross-arch
+FMA contraction floor that bounds CUDA-PTX vs CPU AVX-512 (the
+`zensim-cuda` crate documents the same regime as "~ULP of cross-arch
+FMA drift"). q90 and the synthetic cases land at ≤ 4e-5.
 
-## The HF-ratio noise floor
+## The HF feature thresholds
 
-Pipeline's `safe_ratio` for the HF energy / texture features uses an
-explicit floor (`1e-10 × n_pixels`) on the denominator instead of CPU's
-`den.abs() > 0.0` strict check. Reason: f32 mul-add fusion on the GPU
-leaves a `~1e-14` per-pixel residue in `Σ (s − mu1)²` for channels
-where the source has *exact* zero variance (e.g. the B channel of a
-grayscale image, where the XYB transfer collapses to a constant). CPU
-SIMD on the same data produces *exact* zero. Without the floor, the
-ratio `sums[11] / sums[10]` blows up to 1e10+ on those channels and
-dominates the weighted feature distance. The floor is well below any
-real HF energy (typical: 1e-3 to 1e0 per pixel) and well above f32
-cancellation noise.
+The pipeline's host-side feature extraction matches CPU
+`zensim::streaming::compute_features` exactly, including the
+**per-pixel-variance threshold** that gates the HF ratios:
+
+```rust
+hf_energy_loss = if var_src > 1e-10 { (1.0 - var_dst / var_src).max(0.0) } else { 0.0 };
+hf_energy_gain = if var_src > 1e-10 { (var_dst / var_src - 1.0).max(0.0) } else { 0.0 };
+hf_mag_loss   = if mad_src > 1e-10 { (1.0 - mad_dst / mad_src).max(0.0) } else { 0.0 };
+```
+
+CPU's threshold is `var_src > 1e-10` (per-pixel variance), NOT
+`den.abs() > 0.0`. Without this the f32 cancellation residue in
+`Σ (s − mu1)²` for constant-colour channels (e.g., the B channel of a
+grayscale image, where the XYB transfer collapses to a fixed value)
+blows up the ratio and dominates the score. CPU and GPU agree on this
+threshold so the feature output is bit-exact across the boundary
+where the HF ratios fold to 0.
+
+## FMA fusion match
+
+The kernels use `cubecl::prelude::fma()` explicitly to replicate CPU's
+`f32::mul_add` chains in:
+- The opsin matrix multiply (`m00*r + (m01*g + (m02*b + K_B0))`)
+- The `cbrtf_fast` Halley iterations
+- The H-blur sums (`sum_sq = fma(s, s, fma(d, d, sum_sq))`)
+- The per-pixel SSIM math (`num_m`, `num_s`, `denom_s`)
+
+`absorbance_bias = -cbrtf_fast(K_B0)` is precomputed on the host using a
+direct port of CPU's `cbrtf_fast` (magic-constant Newton seed + 2 Halley
+iterations) and passed to the kernel as a runtime scalar — the bit-cast
+inside `cbrtf_initial` triggers cubecl-cuda's
+`reinterpret_cast<u32 const&>(literal)` codegen failure when applied to
+a const-folded `K_B0` literal.
+
+## Performance
+
+Wall-clock measurements on RTX 5070 + CUDA 13.2 (Ryzen 9 7950X CPU
+reference). `examples/bench.rs` runs N=8 iterations after 2 warm-ups.
+`gpu_cwr` is the cached-reference path (`set_reference` once, then
+`compute_with_reference` per call); `gpu_full` includes both phases
+each call.
+
+| Size       | CPU      | GPU (cached-ref) | GPU (full)  | GPU vs CPU (cwr) |
+|------------|----------|------------------|-------------|------------------|
+| 64×64      |  1.84 ms |   1.35 ms        |   1.74 ms   | **1.4× faster**  |
+| 256×256    |  4.45 ms |   3.95 ms        |   4.41 ms   | **1.1× faster**  |
+| 512×512    |  6.92 ms |  10.67 ms        |  17.32 ms   | 1.5× slower      |
+| 1024×1024  | 14.42 ms |  23.97 ms        |  36.00 ms   | 1.7× slower      |
+| 2048×2048  | 58.12 ms | 164.90 ms        | 307.15 ms   | 2.8× slower      |
+| 4096×4096  | 301.7 ms | 723.18 ms        | 1446.3 ms   | 2.4× slower      |
+
+Small images (≤ 256²) are GPU-favoured because the launch overhead is
+amortised over enough work; large images currently regress because
+the per-column V-blur kernel only achieves `padded_w` parallel threads
+(~2 K at 2 K image, ~4 K at 4 K), severely underutilising the SMs on
+modern NVIDIA GPUs (RTX 5070 has 64 SMs × 96 cores). The follow-up
+"split-column V-blur" optimisation (process multiple Y-strips per
+column, fold per-strip partials in a second pass) would lift the
+parallelism to ~16 K threads at 4 K and is the obvious next perf win.
+
+Optimisations applied since the initial port:
+- **Persistent partials buffers** (`Zensim::new`-time allocation, no
+  per-call alloc churn). 12 small allocations / call → 0. Win at 64²
+  was 8.5 ms → 1.35 ms (6.3×).
+- **Single batched read-back**. Replaced 12 `client.read_one(…)`
+  blocking sync points with one. The H+V kernel launches now pipeline
+  asynchronously inside cubecl's queue; only the final fold blocks.
+- **No partials zeroing** between calls. Every column thread writes
+  all 17 + 3 of its slots in `fused_vblur_features_kernel`, so the
+  previous call's contents are fully overwritten before any host fold
+  reads them — no `memset` or zero-upload needed.
 
 ## Backend coverage
 
