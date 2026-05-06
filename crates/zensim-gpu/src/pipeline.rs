@@ -79,15 +79,16 @@ fn alloc_zeros_u32<R: Runtime>(client: &ComputeClient<R>, n: usize) -> cubecl::s
 /// Choose a per-scale strip count to keep V-blur GPU-occupied at all
 /// resolutions. The kernel's parallelism is `padded_w × n_strips × 3
 /// channels`. RTX-5070-class GPUs want ≥ 16 K resident threads to
-/// hide latency; this keeps us above that from 256² up.
+/// hide latency.
 fn pick_n_strips(padded_w: u32, height: u32) -> u32 {
     if height <= 64 {
         1
-    } else if padded_w >= 1024 {
-        // 1 K+ images need extra Y-axis parallelism.
-        if height >= 1024 { 8 } else { 4 }
-    } else {
+    } else if height >= 1024 {
+        8
+    } else if padded_w >= 256 {
         4
+    } else {
+        2
     }
 }
 
