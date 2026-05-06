@@ -61,7 +61,12 @@ KNOB_GRIDS = {
 # Metric set: add butteraugli (both columns from one compute)
 METRICS = ["zensim", "ssim2_gpu", "butteraugli"]
 
-CHUNK_SIZE = 25  # smaller than v05c (50) to keep per-chunk wall-time bounded
+CHUNK_SIZE = 2  # smaller than v05c (50), v06 (25), v07-v11 (5) — pairs with
+                 # onstart_v3.sh's mid-chunk partial-flush sidecar. ~25-30 min
+                 # per chunk wall-time so a worker crash loses ≤1 chunk + ≤60s
+                 # of in-progress rows. Tradeoff: ~12× more S3 ops than
+                 # CHUNK_SIZE=25, still well below R2 op caps (R2 free tier is
+                 # 1M class-A ops/mo; even at 200 workers × 12× we're <100k/day).
 
 
 def main():

@@ -277,7 +277,26 @@ process_chunk() {
     # Captured per chunk; finalize step concatenates across workers.
     local OUT_PARQUET="$WORKDIR/features-${chunk_id}.parquet"
     local FEATURES_KEY="${OUT_KEY%.tsv}.features.parquet"
+    local PARTIAL_KEY="s3://coefficient/partials/${SWEEP_RUN_ID}/${codec}/${chunk_id}.partial.tsv"
+
+    # Mid-chunk flush sidecar: every 60s while zen-metrics is encoding, copy
+    # the in-progress TSV to a partial key. On normal completion we delete
+    # the partial after the final upload lands; on crash/kill the partial
+    # is what survives. Only the TSV is flushed — parquet is written by
+    # zen-metrics atomically at end-of-run, no streaming hook available.
+    local FLUSH_INTERVAL=60
     local start_t; start_t=$(date +%s)
+    (
+        while sleep "$FLUSH_INTERVAL"; do
+            [[ -f "$OUT_TSV" ]] || continue
+            local rows; rows=$(($(wc -l < "$OUT_TSV" 2>/dev/null) - 1))
+            (( rows > 0 )) || continue
+            R2 cp "$OUT_TSV" "$PARTIAL_KEY" 2>/dev/null || true
+            log "[flush] $chunk_id ${rows}rows partial=${PARTIAL_KEY##*/}"
+        done
+    ) &
+    local FLUSH_PID=$!
+
     if "$BIN" sweep \
         --codec "$codec" \
         --sources "$STAGE" \
@@ -289,6 +308,8 @@ process_chunk() {
         --feature-output "$OUT_PARQUET" \
         > "/tmp/sweep-${chunk_id}.log" 2>&1
     then
+        # Stop sidecar before final upload to avoid racing with successful path.
+        kill "$FLUSH_PID" 2>/dev/null; wait "$FLUSH_PID" 2>/dev/null || true
         local elapsed=$(( $(date +%s) - start_t ))
         local rows
         rows=$(($(wc -l < "$OUT_TSV") - 1))
@@ -296,10 +317,18 @@ process_chunk() {
         if [[ -f "$OUT_PARQUET" ]]; then
             R2 cp "$OUT_PARQUET" "$FEATURES_KEY" || true
         fi
+        # Final upload landed — partial is now redundant; remove it.
+        R2 rm "$PARTIAL_KEY" 2>/dev/null || true
         ( flock -x 200; echo $(( $(cat /tmp/rows_done) + rows )) > /tmp/rows_done ) 200>/tmp/rows_done.lock
         echo "[done] $chunk_id ${elapsed}s ${rows}rows"
     else
+        kill "$FLUSH_PID" 2>/dev/null; wait "$FLUSH_PID" 2>/dev/null || true
         echo "[fail] $chunk_id (see /tmp/sweep-${chunk_id}.log)"
+        # Best-effort one last partial flush — captures whatever zen-metrics
+        # wrote before exiting, even if the FLUSH_INTERVAL hadn't fired yet.
+        if [[ -f "$OUT_TSV" && $(wc -l < "$OUT_TSV") -gt 1 ]]; then
+            R2 cp "$OUT_TSV" "$PARTIAL_KEY" 2>/dev/null || true
+        fi
         R2 cp "/tmp/sweep-${chunk_id}.log" \
             "s3://coefficient/heartbeats/${SWEEP_RUN_ID}/errors/${chunk_id}.log" 2>/dev/null || true
     fi
