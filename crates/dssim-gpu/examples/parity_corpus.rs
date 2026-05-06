@@ -56,16 +56,18 @@ fn main() {
 
     println!(
         "corpus parity: dssim-core (CPU) vs dssim-gpu ({} backend) on {}×{} reference",
-        std::any::type_name::<Backend>().rsplit("::").next().unwrap(),
+        std::any::type_name::<Backend>()
+            .rsplit("::")
+            .next()
+            .unwrap(),
         w,
         h
     );
-    println!(
-        "{:<8} {:>14} {:>14} {:>10}",
-        "case", "cpu", "gpu", "rel %"
-    );
+    println!("{:<8} {:>14} {:>14} {:>10}", "case", "cpu", "gpu", "rel %");
 
-    let mut quals = vec!["q1.jpg", "q5.jpg", "q20.jpg", "q45.jpg", "q70.jpg", "q90.jpg"];
+    let mut quals = vec![
+        "q1.jpg", "q5.jpg", "q20.jpg", "q45.jpg", "q70.jpg", "q90.jpg",
+    ];
     quals.retain(|q| dir.join(q).exists());
 
     for q in quals {

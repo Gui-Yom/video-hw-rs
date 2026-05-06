@@ -36,9 +36,8 @@ macro_rules! make_client {
 
 fn cpu_score(rgb_ref: &[u8], rgb_dis: &[u8], w: usize, h: usize) -> f64 {
     let z = ZensimCpu::new(ZensimProfile::latest());
-    let to_pix = |buf: &[u8]| -> Vec<[u8; 3]> {
-        buf.chunks_exact(3).map(|c| [c[0], c[1], c[2]]).collect()
-    };
+    let to_pix =
+        |buf: &[u8]| -> Vec<[u8; 3]> { buf.chunks_exact(3).map(|c| [c[0], c[1], c[2]]).collect() };
     let src = to_pix(rgb_ref);
     let dst = to_pix(rgb_dis);
     let s = RgbSlice::new(&src, w, h);
@@ -47,7 +46,9 @@ fn cpu_score(rgb_ref: &[u8], rgb_dis: &[u8], w: usize, h: usize) -> f64 {
 }
 
 fn gpu_score<R: Runtime>(z: &mut Zensim<R>, rgb_ref: &[u8], rgb_dis: &[u8]) -> f64 {
-    let features = z.compute_features(rgb_ref, rgb_dis).expect("compute_features");
+    let features = z
+        .compute_features(rgb_ref, rgb_dis)
+        .expect("compute_features");
     score_from_features(&features, &zensim::profile::WEIGHTS_PREVIEW_V0_2)
 }
 
@@ -149,8 +150,7 @@ fn cached_reference_matches_direct() {
     let mut z_two = Zensim::<Backend>::new(make_client!(), w, h).unwrap();
     z_two.set_reference(&r).unwrap();
     let cached_features = z_two.compute_with_reference(&d).unwrap();
-    let cached =
-        score_from_features(&cached_features, &zensim::profile::WEIGHTS_PREVIEW_V0_2);
+    let cached = score_from_features(&cached_features, &zensim::profile::WEIGHTS_PREVIEW_V0_2);
 
     eprintln!("direct = {direct:.6}, cached = {cached:.6}");
     let abs = (direct - cached).abs();

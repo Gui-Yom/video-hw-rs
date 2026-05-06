@@ -69,12 +69,13 @@ fn main() {
     let client = Backend::client(&Default::default());
     let mut z = Zensim::<Backend>::new(client, w as u32, h as u32).unwrap();
     let gpu_features = z.compute_features(&r, &d).unwrap();
-    let gpu_score = score_from_features(
-        &gpu_features,
-        &zensim::profile::WEIGHTS_PREVIEW_V0_2,
-    );
+    let gpu_score = score_from_features(&gpu_features, &zensim::profile::WEIGHTS_PREVIEW_V0_2);
 
-    println!("cpu score = {cpu_score:.10}, gpu score = {gpu_score:.10}, abs diff = {:.4e}, rel = {:.4e}", (gpu_score - cpu_score).abs(), (gpu_score - cpu_score).abs() / cpu_score.abs().max(1.0));
+    println!(
+        "cpu score = {cpu_score:.10}, gpu score = {gpu_score:.10}, abs diff = {:.4e}, rel = {:.4e}",
+        (gpu_score - cpu_score).abs(),
+        (gpu_score - cpu_score).abs() / cpu_score.abs().max(1.0)
+    );
     println!("{:>4} {:>14} {:>14} {:>10}", "i", "cpu", "gpu", "abs");
     let mut max_abs = 0.0f64;
     let mut max_idx = 0usize;

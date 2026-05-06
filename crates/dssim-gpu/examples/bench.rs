@@ -33,7 +33,9 @@ fn make_image(w: usize, h: usize, seed: u32) -> Vec<u8> {
 fn cpu_dssim(ref_data: &[u8], dis_data: &[u8], w: usize, h: usize) -> f64 {
     let dssim = DssimCpu::new();
     let to_rgb = |buf: &[u8]| -> Vec<RGB<u8>> {
-        buf.chunks_exact(3).map(|c| RGB::new(c[0], c[1], c[2])).collect()
+        buf.chunks_exact(3)
+            .map(|c| RGB::new(c[0], c[1], c[2]))
+            .collect()
     };
     let ref_rgb = to_rgb(ref_data).to_rgblu();
     let dis_rgb = to_rgb(dis_data).to_rgblu();
@@ -90,7 +92,14 @@ fn bench_size(w: u32, h: u32) {
     let speed_full = cpu / gpu_full;
     println!(
         "{:>5}x{:<5}  cpu {:>8.2} ms  gpu_cwr {:>8.2} ms ({:>5.1}× faster)  gpu_full {:>8.2} ms ({:>5.1}×)  ({:.2} MP)",
-        w, h, cpu * 1e3, gpu_cwr * 1e3, speed_cwr, gpu_full * 1e3, speed_full, mp
+        w,
+        h,
+        cpu * 1e3,
+        gpu_cwr * 1e3,
+        speed_cwr,
+        gpu_full * 1e3,
+        speed_full,
+        mp
     );
 }
 

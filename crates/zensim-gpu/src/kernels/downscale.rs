@@ -9,8 +9,12 @@ use cubecl::prelude::*;
 
 #[cube(launch_unchecked)]
 pub fn downscale_2x_3ch_kernel(
-    src_a: &Array<f32>, src_b: &Array<f32>, src_c: &Array<f32>,
-    dst_a: &mut Array<f32>, dst_b: &mut Array<f32>, dst_c: &mut Array<f32>,
+    src_a: &Array<f32>,
+    src_b: &Array<f32>,
+    src_c: &Array<f32>,
+    dst_a: &mut Array<f32>,
+    dst_b: &mut Array<f32>,
+    dst_c: &mut Array<f32>,
     src_w: u32,
     src_h: u32,
     dst_w: u32,

@@ -244,15 +244,19 @@ impl<R: Runtime> Zensim<R> {
         let src_u8_b = alloc_zeros_u32(&client, pixels);
 
         // Upload the 256-entry LUT once at construction.
-        let srgb_lut = client.create_from_slice(f32::as_bytes(&crate::kernels::color::SRGB8_TO_LINEARF32_LUT));
+        let srgb_lut = client.create_from_slice(f32::as_bytes(
+            &crate::kernels::color::SRGB8_TO_LINEARF32_LUT,
+        ));
 
         // Persistent partials buffers. Each `compute_with_reference`
         // call overwrites them via the V-blur+features kernel (one
         // slot per thread, no zeroing required), then the on-device
         // reduction kernel folds them into the small `finals_*` for
         // host read-back.
-        let partials_f64 = client.create_from_slice(f64::as_bytes(&vec![0.0_f64; partials_f64_total]));
-        let partials_max = client.create_from_slice(f32::as_bytes(&vec![0.0_f32; partials_max_total]));
+        let partials_f64 =
+            client.create_from_slice(f64::as_bytes(&vec![0.0_f64; partials_f64_total]));
+        let partials_max =
+            client.create_from_slice(f32::as_bytes(&vec![0.0_f32; partials_max_total]));
         let n_finals_f64 = scales.len() * 3 * 17;
         let n_finals_max = scales.len() * 3 * 3;
         let finals_f64 = client.create_from_slice(f64::as_bytes(&vec![0.0_f64; n_finals_f64]));
@@ -318,10 +322,7 @@ impl<R: Runtime> Zensim<R> {
     /// Compute the 228-feature vector for one distorted image against
     /// the cached reference. Returns [`Error::NoCachedReference`] if
     /// [`Zensim::set_reference`] hasn't been called.
-    pub fn compute_with_reference(
-        &mut self,
-        dist_srgb: &[u8],
-    ) -> Result<[f64; TOTAL_FEATURES]> {
+    pub fn compute_with_reference(&mut self, dist_srgb: &[u8]) -> Result<[f64; TOTAL_FEATURES]> {
         if !self.has_cached_reference {
             return Err(Error::NoCachedReference);
         }
@@ -477,11 +478,7 @@ impl<R: Runtime> Zensim<R> {
         // unchanged. Saves 3× the H2D bandwidth vs the older "widen
         // each u8 to its own u32" layout — significant on WSL2 where
         // PCIe throughput is virtualised down to ~3 GB/s.
-        for (dst, chunk) in self
-            .pack_scratch
-            .iter_mut()
-            .zip(srgb.chunks_exact(3))
-        {
+        for (dst, chunk) in self.pack_scratch.iter_mut().zip(srgb.chunks_exact(3)) {
             *dst = (chunk[0] as u32) | ((chunk[1] as u32) << 8) | ((chunk[2] as u32) << 16);
         }
         let bytes = u32::as_bytes(&self.pack_scratch);

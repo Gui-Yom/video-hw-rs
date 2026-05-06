@@ -39,8 +39,8 @@ pub fn reduce_scale_kernel(
 
     if slot_kind < 17u32 {
         // f64 sum reduction.
-        let f64_ch_off = (f64_slot_off as usize)
-            + (channel as usize) * (n_partials_per_ch as usize) * 17;
+        let f64_ch_off =
+            (f64_slot_off as usize) + (channel as usize) * (n_partials_per_ch as usize) * 17;
         let inner = slot_kind as usize;
 
         let mut shared = SharedMemory::<f64>::new(256usize);
@@ -68,8 +68,8 @@ pub fn reduce_scale_kernel(
         }
     } else {
         // f32 max reduction.
-        let max_ch_off = (max_slot_off as usize)
-            + (channel as usize) * (n_partials_per_ch as usize) * 3;
+        let max_ch_off =
+            (max_slot_off as usize) + (channel as usize) * (n_partials_per_ch as usize) * 3;
         let inner = (slot_kind - 17u32) as usize;
 
         let mut shared = SharedMemory::<f32>::new(256usize);

@@ -57,7 +57,11 @@ fn bench_size_phases(w: u32, h: u32) {
 
     println!(
         "phases {:>5}x{:<5}  total {:>7.2} ms  set_ref {:>7.2} ms  cwr-only ~{:>7.2} ms",
-        w, h, total * 1e3, setref * 1e3, (total - setref) * 1e3
+        w,
+        h,
+        total * 1e3,
+        setref * 1e3,
+        (total - setref) * 1e3
     );
 }
 

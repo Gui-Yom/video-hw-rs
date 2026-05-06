@@ -81,12 +81,15 @@ const INV_DIAM: f32 = 1.0 / 11.0;
 
 #[cube(launch_unchecked)]
 pub fn fused_features_kernel(
-    src_a: &Array<f32>, dst_a: &Array<f32>,
-    src_b: &Array<f32>, dst_b: &Array<f32>,
-    src_c: &Array<f32>, dst_c: &Array<f32>,
+    src_a: &Array<f32>,
+    dst_a: &Array<f32>,
+    src_b: &Array<f32>,
+    dst_b: &Array<f32>,
+    src_c: &Array<f32>,
+    dst_c: &Array<f32>,
     partials_f64: &mut Array<f64>,
     partials_max: &mut Array<f32>,
-    width: u32,    // padded_w
+    width: u32, // padded_w
     height: u32,
     n_strips: u32,
     slot_off_f64: u32,
@@ -110,8 +113,7 @@ pub fn fused_features_kernel(
     let strip_h_base = height / n_strips;
     let strip_rem = height - strip_h_base * n_strips;
     let y_start = strip * strip_h_base + u32::min(strip, strip_rem);
-    let y_end_unclamp =
-        y_start + strip_h_base + (if strip < strip_rem { 1u32 } else { 0u32 });
+    let y_end_unclamp = y_start + strip_h_base + (if strip < strip_rem { 1u32 } else { 0u32 });
     let y_end = u32::min(y_end_unclamp, height);
 
     // Shared memory.
@@ -156,7 +158,11 @@ pub fn fused_features_kernel(
     while k < DIAM {
         // Mirror y_in for prefix row.
         let raw_y = (y_start + k + period_y - R) % period_y;
-        let y_in = if raw_y < height { raw_y } else { period_y - raw_y };
+        let y_in = if raw_y < height {
+            raw_y
+        } else {
+            period_y - raw_y
+        };
 
         sync_cube();
         // Cooperative load: each thread loads up to ceil(TILE_COLS / TX) entries.
@@ -165,7 +171,11 @@ pub fn fused_features_kernel(
             let load_x = i * TX + tx;
             // Mirror x for column col_base - R + load_x.
             let raw_x = (col_base + load_x + period_x - R) % period_x;
-            let gx = if raw_x < width { raw_x } else { period_x - raw_x };
+            let gx = if raw_x < width {
+                raw_x
+            } else {
+                period_x - raw_x
+            };
             let off = (y_in as usize) * w + (gx as usize);
             // Channel switch.
             let mut s_val = 0.0_f32;
@@ -316,14 +326,22 @@ pub fn fused_features_kernel(
         let old_s12 = buf_s12[buf_idx];
 
         let raw_y = (y + R + 1u32 + period_y) % period_y;
-        let y_in = if raw_y < height { raw_y } else { period_y - raw_y };
+        let y_in = if raw_y < height {
+            raw_y
+        } else {
+            period_y - raw_y
+        };
 
         sync_cube();
         let mut i: u32 = 0u32;
         while i * TX + tx < TILE_COLS {
             let load_x = i * TX + tx;
             let raw_x = (col_base + load_x + period_x - R) % period_x;
-            let gx = if raw_x < width { raw_x } else { period_x - raw_x };
+            let gx = if raw_x < width {
+                raw_x
+            } else {
+                period_x - raw_x
+            };
             let off2 = (y_in as usize) * w + (gx as usize);
             let mut s_val = 0.0_f32;
             let mut d_val = 0.0_f32;
@@ -382,9 +400,8 @@ pub fn fused_features_kernel(
     if !in_bounds {
         terminate!();
     }
-    let slot_idx_us = (channel as usize) * n_strips_us * pw
-        + (strip as usize) * pw
-        + (col as usize);
+    let slot_idx_us =
+        (channel as usize) * n_strips_us * pw + (strip as usize) * pw + (col as usize);
     let f64_base = (slot_off_f64 as usize) + slot_idx_us * 17;
     partials_f64[f64_base] = a0;
     partials_f64[f64_base + 1] = a1;
