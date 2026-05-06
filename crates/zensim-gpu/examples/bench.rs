@@ -25,11 +25,47 @@ fn make_image(w: usize, h: usize, seed: u32) -> Vec<u8> {
     v
 }
 
+fn bench_size_phases(w: u32, h: u32) {
+    use cubecl::server::ComputeServer;
+    let img_a = make_image(w as usize, h as usize, 42);
+    let img_b = make_image(w as usize, h as usize, 137);
+    let client = Backend::client(&Default::default());
+    let mut z = Zensim::<Backend>::new(client.clone(), w, h).unwrap();
+    z.set_reference(&img_a).unwrap();
+
+    let n_warmup = 4;
+    let n_measure = 16;
+    for _ in 0..n_warmup {
+        let _ = z.compute_with_reference(&img_b).unwrap();
+    }
+
+    // Total wall.
+    let t0 = Instant::now();
+    for _ in 0..n_measure {
+        let _ = z.compute_with_reference(&img_b).unwrap();
+    }
+    let total = t0.elapsed().as_secs_f64() / n_measure as f64;
+
+    // Just the upload and host-fold parts (run set_reference each iter,
+    // which is the upload + run_xyb_pyramid path; minus that we get
+    // an estimate of the kernel pipeline + read).
+    let t0 = Instant::now();
+    for _ in 0..n_measure {
+        z.set_reference(&img_a).unwrap();
+    }
+    let setref = t0.elapsed().as_secs_f64() / n_measure as f64;
+
+    println!(
+        "phases {:>5}x{:<5}  total {:>7.2} ms  set_ref {:>7.2} ms  cwr-only ~{:>7.2} ms",
+        w, h, total * 1e3, setref * 1e3, (total - setref) * 1e3
+    );
+}
+
 fn bench_size(w: u32, h: u32) {
     let img_a = make_image(w as usize, h as usize, 42);
     let img_b = make_image(w as usize, h as usize, 137);
-    let n_warmup = 2;
-    let n_measure = 8;
+    let n_warmup = 4;
+    let n_measure = 16;
 
     // GPU: cached-reference path (set_reference once, compute many).
     let client = Backend::client(&Default::default());
@@ -103,5 +139,9 @@ fn main() {
         (4096, 4096),
     ] {
         bench_size(w, h);
+    }
+    println!();
+    for (w, h) in [(256, 256), (1024, 1024), (2048, 2048), (4096, 4096)] {
+        bench_size_phases(w, h);
     }
 }

@@ -83,33 +83,60 @@ each call.
 
 | Size       | CPU      | GPU (cached-ref) | GPU (full)  | GPU vs CPU (cwr) |
 |------------|----------|------------------|-------------|------------------|
-| 64×64      |  1.84 ms |   1.35 ms        |   1.74 ms   | **1.4× faster**  |
-| 256×256    |  4.45 ms |   3.95 ms        |   4.41 ms   | **1.1× faster**  |
-| 512×512    |  6.92 ms |  10.67 ms        |  17.32 ms   | 1.5× slower      |
-| 1024×1024  | 14.42 ms |  23.97 ms        |  36.00 ms   | 1.7× slower      |
-| 2048×2048  | 58.12 ms | 164.90 ms        | 307.15 ms   | 2.8× slower      |
-| 4096×4096  | 301.7 ms | 723.18 ms        | 1446.3 ms   | 2.4× slower      |
+| 64×64      |  1.49 ms |   0.68 ms        |   0.81 ms   | **2.2× faster**  |
+| 256×256    |  4.16 ms |   1.13 ms        |   1.28 ms   | **3.7× faster**  |
+| 512×512    |  9.46 ms |   2.42 ms        |   2.26 ms   | **3.9× faster**  |
+| 1024×1024  | 16.35 ms |   6.33 ms        |   7.54 ms   | **2.6× faster**  |
+| 2048×2048  | 44.59 ms |  15.78 ms        |  24.91 ms   | **2.8× faster**  |
+| 4096×4096  | 248.6 ms |  95.57 ms        | 179.49 ms   | **2.6× faster**  |
 
-Small images (≤ 256²) are GPU-favoured because the launch overhead is
-amortised over enough work; large images currently regress because
-the per-column V-blur kernel only achieves `padded_w` parallel threads
-(~2 K at 2 K image, ~4 K at 4 K), severely underutilising the SMs on
-modern NVIDIA GPUs (RTX 5070 has 64 SMs × 96 cores). The follow-up
-"split-column V-blur" optimisation (process multiple Y-strips per
-column, fold per-strip partials in a second pass) would lift the
-parallelism to ~16 K threads at 4 K and is the obvious next perf win.
+GPU now beats CPU at every resolution. Per-MP timing (lower is better):
+
+| Size       | gpu_cwr (ms/MP) |
+|------------|-----------------|
+| 1024²      | 6.0             |
+| 2048²      | 3.8             |
+| 4096²      | 5.7             |
+
+Best per-MP at 2 K. The 1 ms/MP target needs further work: a tile-fused
+H+V kernel that keeps H-blur outputs in shared memory (eliminates the
+~50 MB inter-kernel DRAM round-trip per scale) and CUDA-graph capture
+to amortise launch overhead in encoder loops. cubecl 0.10 doesn't
+expose graph capture, so this is upstream-blocked for the launch-
+overhead piece.
 
 Optimisations applied since the initial port:
 - **Persistent partials buffers** (`Zensim::new`-time allocation, no
-  per-call alloc churn). 12 small allocations / call → 0. Win at 64²
-  was 8.5 ms → 1.35 ms (6.3×).
-- **Single batched read-back**. Replaced 12 `client.read_one(…)`
-  blocking sync points with one. The H+V kernel launches now pipeline
-  asynchronously inside cubecl's queue; only the final fold blocks.
+  per-call alloc churn). 12 small allocations / call → 0.
+- **Single batched read-back of finals only**. After the on-device
+  reduction the host reads ~1.6 KiB instead of ~5.7 MiB per call at
+  1 K resolution.
+- **3-channel-per-launch H-blur and V-blur+features kernels**.
+  Reduces 24 per-call launches → 8.
+- **3-channel-per-launch downscale**. Saves 6 launches across the
+  pyramid build.
+- **Column-strip parallelism in V-blur+features**. Each column is split
+  into `n_strips` Y-strips, each processed by its own thread —
+  `padded_w × n_strips × 3` parallel threads at the SM-occupancy floor
+  (lifts 1 K perf 2× over the old per-column-only kernel).
+- **On-device reduction kernel** (`reduce_scale_kernel`). Folds per-
+  (col, strip, channel) partials into per-(scale, channel, slot)
+  finals on the GPU. One launch per scale (4 total at SCALES = 4)
+  with a 60-cube grid (3 channels × 20 slot kinds). Cuts the post-
+  compute D2H from a multi-MiB read to a 1.6 KiB read.
+- **Fused sRGB → XYB + mirror-pad in one launch**. The kernel covers
+  the padded plane and reads from the mirror source column when
+  `x ≥ width`. Eliminates the separate per-channel pad pass (was 3
+  launches).
+- **Packed sRGB-RGB upload**: one u32 per pixel (`R | G<<8 | B<<16`)
+  instead of 3 widened u32s. Cuts H2D bandwidth 3× — load-bearing on
+  WSL2 where virtualised PCIe is the dominant cost.
+- **Persistent host pack scratch**: reused across calls so the u8 →
+  u32 packing doesn't re-allocate.
 - **No partials zeroing** between calls. Every column thread writes
   all 17 + 3 of its slots in `fused_vblur_features_kernel`, so the
-  previous call's contents are fully overwritten before any host fold
-  reads them — no `memset` or zero-upload needed.
+  previous call's contents are fully overwritten before any reduction
+  reads them.
 
 ## Backend coverage
 

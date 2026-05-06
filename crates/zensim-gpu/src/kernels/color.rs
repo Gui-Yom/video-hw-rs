@@ -116,14 +116,28 @@ fn cbrtf_fast_runtime(x: f32) -> f32 {
     t1 * (fma(2.0, x, r1) / fma(2.0, r1, x))
 }
 
-/// sRGB packed RGB u8 → 3 planar positive-XYB f32 buffers.
+/// sRGB packed RGB u8 → 3 planar positive-XYB f32 buffers, with
+/// SIMD-padding columns mirror-filled in the same launch.
+///
+/// Input is `Array<u32>` with one packed pixel per element:
+/// `R | (G << 8) | (B << 16)`. This is 1/3 the upload size of the
+/// older "u8-widened-to-u32" layout (4 B vs 12 B per pixel), which
+/// matters under WSL2's slow virtualised PCIe.
 ///
 /// `absorbance_bias_neg = -cbrtf_fast(K_B0)` is precomputed host-side
 /// and passed as a runtime scalar.
+///
+/// Each thread handles one OUTPUT pixel of the `(padded_w × height)`
+/// plane. For columns `[0..width)` it reads from `src`; for columns
+/// `[width..padded_w)` it reads from the mirror source column
+/// (precomputed in `mirror_offsets` — same table the standalone
+/// `pad_mirror_plane_kernel` would have used) and computes XYB on
+/// that reflected pixel. Eliminates the separate pad-pass launches.
 #[cube(launch_unchecked)]
 pub fn srgb_to_positive_xyb_kernel(
     src: &Array<u32>,
     lut: &Array<f32>,
+    mirror_offsets: &Array<u32>,
     x_out: &mut Array<f32>,
     y_out: &mut Array<f32>,
     b_out: &mut Array<f32>,
@@ -133,19 +147,28 @@ pub fn srgb_to_positive_xyb_kernel(
     absorbance_bias_neg: f32,
 ) {
     let idx = ABSOLUTE_POS;
-    let total = (width * height) as usize;
+    let total = (padded_w * height) as usize;
     if idx >= total {
         terminate!();
     }
-    let w = width as usize;
     let pw = padded_w as usize;
-    let y = idx / w;
-    let x = idx - y * w;
+    let w = width as usize;
+    let y = idx / pw;
+    let x = idx - y * pw;
 
-    let i3 = idx * 3;
-    let r = lut[src[i3] as usize];
-    let g = lut[src[i3 + 1] as usize];
-    let b = lut[src[i3 + 2] as usize];
+    // For pad columns, redirect to the mirror source column. The
+    // mirror table has `padded_w - width` entries indexed
+    // `[x - width]` for `x ∈ [width, padded_w)`.
+    let src_x = if x < (width as usize) {
+        x
+    } else {
+        mirror_offsets[x - w] as usize
+    };
+    let src_idx = y * w + src_x;
+    let pixel = src[src_idx];
+    let r = lut[(pixel & 0xFFu32) as usize];
+    let g = lut[((pixel >> 8u32) & 0xFFu32) as usize];
+    let b = lut[((pixel >> 16u32) & 0xFFu32) as usize];
 
     // Match CPU SIMD FMA fusion: `m00 * r + (m01 * g + (m02 * b + K_B0))`.
     let inner0 = fma(K_M02, b, K_B0);
@@ -173,8 +196,7 @@ pub fn srgb_to_positive_xyb_kernel(
     let y_pos = y_val + 0.01;
     let b_pos = (t2 - y_val) + 0.55;
 
-    let out_idx = y * pw + x;
-    x_out[out_idx] = x_pos;
-    y_out[out_idx] = y_pos;
-    b_out[out_idx] = b_pos;
+    x_out[idx] = x_pos;
+    y_out[idx] = y_pos;
+    b_out[idx] = b_pos;
 }

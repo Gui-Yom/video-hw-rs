@@ -1,98 +1,125 @@
-//! Fused vertical-blur + per-pixel feature extraction.
+//! Fused vertical-blur + per-pixel feature extraction, 3-channel +
+//! column-strip parallel.
 //!
-//! Mirrors `zensim-cuda-kernel/src/features.rs`, which itself is a
-//! straight port of CPU zensim's scalar `fused_vblur_ssim_inner`.
+//! Mirrors `zensim-cuda-kernel/src/features.rs` and CPU
+//! `zensim::fused::fused_vblur_ssim_inner`. The compute is the same;
+//! the launch geometry is different.
 //!
-//! ## Layout
+//! ## Launch geometry
 //!
-//! One thread per output column (1D launch, `padded_w` threads). Each
-//! thread walks `y` sequentially through the column, maintaining four
-//! `f32` running sums over the `diam = 2·radius + 1`-tap V-blur
-//! window. Per-thread accumulators are kept in `f64` (17 sums) and
-//! `f32` (3 maxes) to match CPU precision; at end-of-column the thread
-//! writes its column's sums to `partials_f64[col * 17 + i]` and its
-//! maxes to `partials_max[col * 3 + i]`. Host-side fold across columns
-//! produces the per-channel feature scalars.
+//! Grid: `(padded_w, n_strips * 3, 1)`. Each thread is a `(col,
+//! strip × ch)` tuple. The strip dimension subdivides each column into
+//! `n_strips` row-ranges so column-bound parallelism scales with image
+//! height — without this the V-blur is bottlenecked at `padded_w`
+//! threads (~2 K at 2 K image), severely underutilising modern GPU SMs
+//! at ≥ 1 K resolution.
 //!
-//! Per-column-slot partials avoid `Atomic<f64>` (cubecl 0.10 doesn't
-//! expose it) and `Atomic<f32>::fetch_max` (broken on Metal per
-//! gotcha G3.x). The trade is `padded_w × 17 × 8` bytes of scratch per
-//! (scale, channel) — 557 KiB at 4 K, well within budget.
+//! Each thread:
+//! 1. Initialises the V-blur window from the mirrored prefix at its
+//!    strip's `y_start`.
+//! 2. Walks `[y_start, y_end)` maintaining the 4 running f32 sliding
+//!    sums and 17 f64 + 3 f32 per-thread accumulators.
+//! 3. Writes its accumulator state to a per-(col, strip, ch) slot in
+//!    the partials buffer. No atomics needed.
 //!
-//! ## Slot meanings (matches CPU `compute_features` in `zensim-cuda`)
+//! Host-side fold sums across cols × strips per (scale, ch). With
+//! `n_strips = 1` this collapses to the original per-column kernel.
 //!
-//! ```text
-//! a[0]  Σ sd       a[1]  Σ sd⁴      a[2]  Σ sd²
-//! a[3]  Σ artifact a[4]  Σ a⁴       a[5]  Σ a²
-//! a[6]  Σ detail   a[7]  Σ d⁴       a[8]  Σ d²
-//! a[9]  Σ (s-d)²
-//! a[10] Σ (s-mu1)² a[11] Σ (d-mu2)² a[12] Σ |s-mu1| a[13] Σ |d-mu2|
-//! a[14] Σ sd⁸      a[15] Σ a⁸       a[16] Σ d⁸
-//! peak[0] max sd, peak[1] max artifact, peak[2] max detail
-//! ```
+//! ## Per-channel offsets
+//!
+//! Per-thread `channel = idx_y / n_strips`, `strip = idx_y % n_strips`.
+//! The kernel reads `h_mu1[ch]` etc. from contiguous Array arguments.
 
 use cubecl::prelude::*;
 
 const C2: f32 = 0.0009;
 
-/// One thread per column. Each thread walks the whole height,
-/// maintaining the V-blur window state and per-column accumulators,
-/// then writes 17 f64 + 3 f32 partials at slots `col * 17` and
-/// `col * 3` respectively.
-///
-/// Mirror logic is inlined in u32: `mirror((y + plus - minus), height)`
-/// is computed as `((y + plus + period - minus) % period) → fold` where
-/// `period = 2 (height - 1)`. Caller guarantees `height ≥ radius + 1`.
+/// Strip-and-channel parallel V-blur + features kernel. One thread per
+/// `(col, strip, channel)` writes 17 f64 + 3 f32 partials into the
+/// shared partials buffer at offset
+/// `slot_off_f64 + (ch * n_strips * pw + strip * pw + col) * 17`.
 #[cube(launch_unchecked)]
 pub fn fused_vblur_features_kernel(
-    h_mu1: &Array<f32>,
-    h_mu2: &Array<f32>,
-    h_sigma_sq: &Array<f32>,
-    h_sigma12: &Array<f32>,
-    src: &Array<f32>,
-    dst: &Array<f32>,
+    h_mu1_a: &Array<f32>, h_mu2_a: &Array<f32>, h_sq_a: &Array<f32>, h_s12_a: &Array<f32>,
+    h_mu1_b: &Array<f32>, h_mu2_b: &Array<f32>, h_sq_b: &Array<f32>, h_s12_b: &Array<f32>,
+    h_mu1_c: &Array<f32>, h_mu2_c: &Array<f32>, h_sq_c: &Array<f32>, h_s12_c: &Array<f32>,
+    src_a: &Array<f32>, dst_a: &Array<f32>,
+    src_b: &Array<f32>, dst_b: &Array<f32>,
+    src_c: &Array<f32>, dst_c: &Array<f32>,
     partials_f64: &mut Array<f64>,
     partials_max: &mut Array<f32>,
-    width: u32, // padded_w
+    width: u32,    // padded_w
     height: u32,
     radius: u32,
+    n_strips: u32,
     slot_off_f64: u32,
     slot_off_max: u32,
 ) {
-    let x_pos = ABSOLUTE_POS;
-    if x_pos >= (width as usize) {
+    let col = CUBE_POS_X * (CUBE_DIM_X as u32) + UNIT_POS_X;
+    let yc = CUBE_POS_Y * (CUBE_DIM_Y as u32) + UNIT_POS_Y;
+    if col >= width {
         terminate!();
     }
+    let n_total_y = n_strips * 3u32;
+    if yc >= n_total_y {
+        terminate!();
+    }
+    let channel = yc / n_strips;
+    let strip = yc - channel * n_strips;
+
     let w = width as usize;
+    let col_us = col as usize;
+    let pw = width as usize;
+    let n_strips_us = n_strips as usize;
     let diam = 2u32 * radius + 1u32;
     let inv = 1.0_f32 / (diam as f32);
     let period = 2u32 * (height - 1u32);
 
-    // Initialise V-blur sums from the mirrored prefix (window y =
-    // k - r for k in 0..diam, i.e. y_pos = 0, plus = k, minus = r).
+    // Compute strip's [y_start, y_end). Last strip absorbs remainder.
+    let strip_h_base = height / n_strips;
+    let strip_rem = height - strip_h_base * n_strips;
+    let y_start = strip * strip_h_base + u32::min(strip, strip_rem);
+    let y_end_unclamp = y_start + strip_h_base + (if strip < strip_rem { 1u32 } else { 0u32 });
+    let y_end = u32::min(y_end_unclamp, height);
+
+    // Pick the channel's input arrays via a manual switch (cubecl 0.10
+    // doesn't index into a stack of `&Array<f32>`).
     let mut sum_m1 = 0.0_f32;
     let mut sum_m2 = 0.0_f32;
     let mut sum_sq = 0.0_f32;
     let mut sum_s12 = 0.0_f32;
+
+    // Initialise V-blur window from mirrored prefix at y_start - r.
     let mut k: u32 = 0u32;
     while k < diam {
-        let raw = (k + period - radius) % period;
+        let raw = (y_start + k + period - radius) % period;
         let row_i = if raw < height {
             raw as usize
         } else {
             (period - raw) as usize
         };
-        let off = row_i * w + x_pos;
-        sum_m1 += h_mu1[off];
-        sum_m2 += h_mu2[off];
-        sum_sq += h_sigma_sq[off];
-        sum_s12 += h_sigma12[off];
+        let off = row_i * w + col_us;
+        if channel == 0u32 {
+            sum_m1 += h_mu1_a[off];
+            sum_m2 += h_mu2_a[off];
+            sum_sq += h_sq_a[off];
+            sum_s12 += h_s12_a[off];
+        } else {
+            if channel == 1u32 {
+                sum_m1 += h_mu1_b[off];
+                sum_m2 += h_mu2_b[off];
+                sum_sq += h_sq_b[off];
+                sum_s12 += h_s12_b[off];
+            } else {
+                sum_m1 += h_mu1_c[off];
+                sum_m2 += h_mu2_c[off];
+                sum_sq += h_sq_c[off];
+                sum_s12 += h_s12_c[off];
+            }
+        }
         k += 1u32;
     }
 
-    // 17 f64 accumulators expanded to scalars (cubecl 0.10's `#[cube]`
-    // macro handles fixed-size local arrays unevenly; scalars compile
-    // reliably across all backends).
     let mut a0 = 0.0_f64;
     let mut a1 = 0.0_f64;
     let mut a2 = 0.0_f64;
@@ -114,23 +141,32 @@ pub fn fused_vblur_features_kernel(
     let mut peak1 = 0.0_f32;
     let mut peak2 = 0.0_f32;
 
-    let mut y: u32 = 0u32;
-    while y < height {
+    let mut y: u32 = y_start;
+    while y < y_end {
         let mu1 = sum_m1 * inv;
         let mu2 = sum_m2 * inv;
         let ssq = sum_sq * inv;
         let s12 = sum_s12 * inv;
 
-        let off = (y as usize) * w + x_pos;
-        let sv = src[off];
-        let dv = dst[off];
+        let off = (y as usize) * w + col_us;
+        let mut sv = 0.0_f32;
+        let mut dv = 0.0_f32;
+        if channel == 0u32 {
+            sv = src_a[off];
+            dv = dst_a[off];
+        } else {
+            if channel == 1u32 {
+                sv = src_b[off];
+                dv = dst_b[off];
+            } else {
+                sv = src_c[off];
+                dv = dst_c[off];
+            }
+        }
 
         // SSIMULACRA2-style SSIM (no C1, uses `1 - (mu1-mu2)²`).
-        // FMA fusion order matches CPU `zensim::fused::fused_vblur_ssim_inner_v4`
-        // exactly:
-        //   num_m   = mu_diff * (-mu_diff) + 1
-        //   num_s   = 2 * (-mu1 * mu2 + s12) + C2
-        //   denom_s = -mu2 * mu2 + (-mu1 * mu1 + ssq) + C2
+        // FMA fusion order matches CPU
+        // `zensim::fused::fused_vblur_ssim_inner_v4` exactly.
         let mu_diff = mu1 - mu2;
         let num_m = fma(mu_diff, -mu_diff, 1.0);
         let inner_ns = fma(-mu1, mu2, s12);
@@ -186,8 +222,7 @@ pub fn fused_vblur_features_kernel(
         let pd = sv - dv;
         a9 += (pd * pd) as f64;
 
-        // Slide V-blur window: add (y + r + 1), remove (y - r). Inlined
-        // mirror — same formula as the prefix init above.
+        // Slide V-blur window.
         let add_raw = (y + radius + 1u32 + period) % period;
         let add_idx = if add_raw < height {
             add_raw as usize
@@ -200,36 +235,55 @@ pub fn fused_vblur_features_kernel(
         } else {
             (period - rem_raw) as usize
         };
-        let a_off = add_idx * w + x_pos;
-        let r_off = rem_idx * w + x_pos;
-        sum_m1 = sum_m1 + h_mu1[a_off] - h_mu1[r_off];
-        sum_m2 = sum_m2 + h_mu2[a_off] - h_mu2[r_off];
-        sum_sq = sum_sq + h_sigma_sq[a_off] - h_sigma_sq[r_off];
-        sum_s12 = sum_s12 + h_sigma12[a_off] - h_sigma12[r_off];
+        let a_off = add_idx * w + col_us;
+        let r_off = rem_idx * w + col_us;
+        if channel == 0u32 {
+            sum_m1 = sum_m1 + h_mu1_a[a_off] - h_mu1_a[r_off];
+            sum_m2 = sum_m2 + h_mu2_a[a_off] - h_mu2_a[r_off];
+            sum_sq = sum_sq + h_sq_a[a_off] - h_sq_a[r_off];
+            sum_s12 = sum_s12 + h_s12_a[a_off] - h_s12_a[r_off];
+        } else {
+            if channel == 1u32 {
+                sum_m1 = sum_m1 + h_mu1_b[a_off] - h_mu1_b[r_off];
+                sum_m2 = sum_m2 + h_mu2_b[a_off] - h_mu2_b[r_off];
+                sum_sq = sum_sq + h_sq_b[a_off] - h_sq_b[r_off];
+                sum_s12 = sum_s12 + h_s12_b[a_off] - h_s12_b[r_off];
+            } else {
+                sum_m1 = sum_m1 + h_mu1_c[a_off] - h_mu1_c[r_off];
+                sum_m2 = sum_m2 + h_mu2_c[a_off] - h_mu2_c[r_off];
+                sum_sq = sum_sq + h_sq_c[a_off] - h_sq_c[r_off];
+                sum_s12 = sum_s12 + h_s12_c[a_off] - h_s12_c[r_off];
+            }
+        }
 
         y += 1u32;
     }
 
-    let base = (slot_off_f64 as usize) + x_pos * 17;
-    partials_f64[base] = a0;
-    partials_f64[base + 1] = a1;
-    partials_f64[base + 2] = a2;
-    partials_f64[base + 3] = a3;
-    partials_f64[base + 4] = a4;
-    partials_f64[base + 5] = a5;
-    partials_f64[base + 6] = a6;
-    partials_f64[base + 7] = a7;
-    partials_f64[base + 8] = a8;
-    partials_f64[base + 9] = a9;
-    partials_f64[base + 10] = a10;
-    partials_f64[base + 11] = a11;
-    partials_f64[base + 12] = a12;
-    partials_f64[base + 13] = a13;
-    partials_f64[base + 14] = a14;
-    partials_f64[base + 15] = a15;
-    partials_f64[base + 16] = a16;
-    let mbase = (slot_off_max as usize) + x_pos * 3;
-    partials_max[mbase] = peak0;
-    partials_max[mbase + 1] = peak1;
-    partials_max[mbase + 2] = peak2;
+    // Write 17 + 3 partials at slot
+    //   ch * n_strips * pw + strip * pw + col, offset 17 within slot.
+    let slot_idx_us = (channel as usize) * n_strips_us * pw
+        + (strip as usize) * pw
+        + col_us;
+    let f64_base = (slot_off_f64 as usize) + slot_idx_us * 17;
+    partials_f64[f64_base] = a0;
+    partials_f64[f64_base + 1] = a1;
+    partials_f64[f64_base + 2] = a2;
+    partials_f64[f64_base + 3] = a3;
+    partials_f64[f64_base + 4] = a4;
+    partials_f64[f64_base + 5] = a5;
+    partials_f64[f64_base + 6] = a6;
+    partials_f64[f64_base + 7] = a7;
+    partials_f64[f64_base + 8] = a8;
+    partials_f64[f64_base + 9] = a9;
+    partials_f64[f64_base + 10] = a10;
+    partials_f64[f64_base + 11] = a11;
+    partials_f64[f64_base + 12] = a12;
+    partials_f64[f64_base + 13] = a13;
+    partials_f64[f64_base + 14] = a14;
+    partials_f64[f64_base + 15] = a15;
+    partials_f64[f64_base + 16] = a16;
+    let max_base = (slot_off_max as usize) + slot_idx_us * 3;
+    partials_max[max_base] = peak0;
+    partials_max[max_base + 1] = peak1;
+    partials_max[max_base + 2] = peak2;
 }

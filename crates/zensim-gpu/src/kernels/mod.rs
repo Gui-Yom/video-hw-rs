@@ -26,4 +26,4 @@ pub mod blur;
 pub mod color;
 pub mod downscale;
 pub mod features;
-pub mod pad;
+pub mod reduce;
