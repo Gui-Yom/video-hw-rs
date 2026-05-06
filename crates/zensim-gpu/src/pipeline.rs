@@ -31,7 +31,7 @@
 
 use cubecl::prelude::*;
 
-use crate::kernels::{blur, color, downscale, features, reduce};
+use crate::kernels::{color, downscale, fused, reduce};
 use crate::{
     BLUR_RADIUS, Error, FEATURES_PER_CHANNEL_BASIC, FEATURES_PER_CHANNEL_PEAKS, Result, SCALES,
     TOTAL_FEATURES, simd_padded_width,
@@ -559,66 +559,24 @@ impl<R: Runtime> Zensim<R> {
         }
     }
 
-    /// Launch H-blur (3-channel) and V-blur+features (3-channel,
-    /// n-strip) for one scale, writing partials into the shared buffer.
-    /// Two kernel launches per scale, no host syncs.
+    /// Launch the **tile-fused H-blur + V-blur + features** kernel for
+    /// one scale. Grid `(ceil(pw/64), n_strips, 3)`; block dim 64.
+    /// One launch per scale (was 2 with the separate H-blur path).
+    /// Eliminates the 12 H-blur scratch planes from DRAM — H-blur
+    /// outputs live in shared memory across the V-blur slide.
     fn launch_blur_and_features(&self, scale: usize) {
+        const TX: u32 = 64;
         let s = &self.scales[scale];
         let pad_total = s.n_padded;
-        let pad_w = s.padded_w as usize;
 
+        let cube_x = ((s.padded_w + TX - 1) / TX).max(1);
+        let cube_count = CubeCount::Static(cube_x, s.n_strips, 3);
+        let cube_dim = CubeDim::new_3d(TX, 1, 1);
         unsafe {
-            blur::fused_blur_h_ssim_3ch_kernel::launch_unchecked::<R>(
-                &self.client,
-                Self::cube_count_1d(pad_total),
-                Self::cube_dim_1d(),
-                ArrayArg::from_raw_parts(s.ref_xyb[0].clone(), pad_total),
-                ArrayArg::from_raw_parts(s.ref_xyb[1].clone(), pad_total),
-                ArrayArg::from_raw_parts(s.ref_xyb[2].clone(), pad_total),
-                ArrayArg::from_raw_parts(s.dis_xyb[0].clone(), pad_total),
-                ArrayArg::from_raw_parts(s.dis_xyb[1].clone(), pad_total),
-                ArrayArg::from_raw_parts(s.dis_xyb[2].clone(), pad_total),
-                ArrayArg::from_raw_parts(s.h_mu1[0].clone(), pad_total),
-                ArrayArg::from_raw_parts(s.h_mu1[1].clone(), pad_total),
-                ArrayArg::from_raw_parts(s.h_mu1[2].clone(), pad_total),
-                ArrayArg::from_raw_parts(s.h_mu2[0].clone(), pad_total),
-                ArrayArg::from_raw_parts(s.h_mu2[1].clone(), pad_total),
-                ArrayArg::from_raw_parts(s.h_mu2[2].clone(), pad_total),
-                ArrayArg::from_raw_parts(s.h_sigma_sq[0].clone(), pad_total),
-                ArrayArg::from_raw_parts(s.h_sigma_sq[1].clone(), pad_total),
-                ArrayArg::from_raw_parts(s.h_sigma_sq[2].clone(), pad_total),
-                ArrayArg::from_raw_parts(s.h_sigma12[0].clone(), pad_total),
-                ArrayArg::from_raw_parts(s.h_sigma12[1].clone(), pad_total),
-                ArrayArg::from_raw_parts(s.h_sigma12[2].clone(), pad_total),
-                s.padded_w,
-                s.h,
-                BLUR_RADIUS,
-            );
-        }
-
-        // V-blur+features. Grid = (padded_w, n_strips × 3, 1) — one
-        // thread per (col, strip, channel). Block = (256, 1, 1).
-        let cube_x = ((s.padded_w + 255) / 256).max(1);
-        let cube_y = (s.n_strips * 3).max(1);
-        let cube_count = CubeCount::Static(cube_x, cube_y, 1);
-        let cube_dim = CubeDim::new_2d(256, 1);
-        unsafe {
-            features::fused_vblur_features_kernel::launch_unchecked::<R>(
+            fused::fused_features_kernel::launch_unchecked::<R>(
                 &self.client,
                 cube_count,
                 cube_dim,
-                ArrayArg::from_raw_parts(s.h_mu1[0].clone(), pad_total),
-                ArrayArg::from_raw_parts(s.h_mu2[0].clone(), pad_total),
-                ArrayArg::from_raw_parts(s.h_sigma_sq[0].clone(), pad_total),
-                ArrayArg::from_raw_parts(s.h_sigma12[0].clone(), pad_total),
-                ArrayArg::from_raw_parts(s.h_mu1[1].clone(), pad_total),
-                ArrayArg::from_raw_parts(s.h_mu2[1].clone(), pad_total),
-                ArrayArg::from_raw_parts(s.h_sigma_sq[1].clone(), pad_total),
-                ArrayArg::from_raw_parts(s.h_sigma12[1].clone(), pad_total),
-                ArrayArg::from_raw_parts(s.h_mu1[2].clone(), pad_total),
-                ArrayArg::from_raw_parts(s.h_mu2[2].clone(), pad_total),
-                ArrayArg::from_raw_parts(s.h_sigma_sq[2].clone(), pad_total),
-                ArrayArg::from_raw_parts(s.h_sigma12[2].clone(), pad_total),
                 ArrayArg::from_raw_parts(s.ref_xyb[0].clone(), pad_total),
                 ArrayArg::from_raw_parts(s.dis_xyb[0].clone(), pad_total),
                 ArrayArg::from_raw_parts(s.ref_xyb[1].clone(), pad_total),
@@ -629,13 +587,11 @@ impl<R: Runtime> Zensim<R> {
                 ArrayArg::from_raw_parts(self.partials_max.clone(), self.partials_max_len),
                 s.padded_w,
                 s.h,
-                BLUR_RADIUS,
                 s.n_strips,
                 s.partials_f64_off as u32,
                 s.partials_max_off as u32,
             );
         }
-        let _ = pad_w;
     }
 
     /// On-device reduction of per-(col, strip, channel) partials into

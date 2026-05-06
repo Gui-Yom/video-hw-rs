@@ -98,14 +98,41 @@ GPU now beats CPU at every resolution. Per-MP timing (lower is better):
 | 2048²      | 3.8             |
 | 4096²      | 5.7             |
 
-Best per-MP at 2 K. The 1 ms/MP target needs further work: a tile-fused
-H+V kernel that keeps H-blur outputs in shared memory (eliminates the
-~50 MB inter-kernel DRAM round-trip per scale) and CUDA-graph capture
-to amortise launch overhead in encoder loops. cubecl 0.10 doesn't
-expose graph capture, so this is upstream-blocked for the launch-
-overhead piece.
+Best per-MP at 2 K. The 1 ms/MP target is **PCIe-bound, not compute-
+bound**, on the WSL2 reference host:
+
+- **set_reference** at 1 MP is ~2.5 ms — dominated by the 4 MiB H2D
+  upload of packed sRGB. WSL2's virtualised PCIe runs at ~3 GiB/s; on
+  native Linux this would be ~10 GiB/s and the upload would drop to
+  ~0.4 ms.
+- **compute_with_reference** at 1 MP is ~5 ms total. Of that:
+  ~1.3 ms is the dis-side upload (same WSL2 PCIe constraint), ~1 ms
+  is the dis-side sRGB→XYB+pyramid kernel work, ~1 ms is the fused
+  H+V+features work (4 launches, one per scale), ~0.2 ms is the
+  on-device reduction, ~0.1 ms is the 1.6 KiB final read-back, and
+  the rest is variance / launch overhead.
+
+To hit 1 ms/MP from here would need:
+1. Native PCIe (or unified memory on Grace Hopper / DGX) — the
+   biggest cost we can't shave with code.
+2. CUDA graph capture — would amortise the ~6 launches × 50 µs of
+   per-call overhead. cubecl 0.10 doesn't expose
+   `cuStreamBeginCapture`; the CUDA crate uses `cudarse_driver`
+   directly. Tracked at tracel-ai/cubecl#1319.
+3. Async upload overlap — cwr(c2)'s upload starts while cwr(c1)'s
+   compute runs. Needs a multi-stream / async API, not in cubecl 0.10.
+
+The tile-fused kernel is now the steady-state path; further kernel
+work would need to go below cubecl into raw PTX or the cudarc
+driver.
 
 Optimisations applied since the initial port:
+- **Tile-fused H-blur + V-blur + features kernel** (`kernels::fused`).
+  One kernel per scale (was H-blur + V-blur as two kernels). H-blur
+  outputs live in shared memory across the V-blur slide instead of
+  round-tripping through DRAM. Eliminates the 12 H-blur scratch planes
+  per scale (~50 MiB at 1 MP) entirely. Block dim 64 with 12 KiB
+  shared per block — ~10 blocks resident per SM.
 - **Persistent partials buffers** (`Zensim::new`-time allocation, no
   per-call alloc churn). 12 small allocations / call → 0.
 - **Single batched read-back of finals only**. After the on-device
