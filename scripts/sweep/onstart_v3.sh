@@ -46,10 +46,45 @@ cd "$WORKDIR"
 
 PARALLEL="${WORKER_PARALLEL:-}"
 if [[ -z "$PARALLEL" ]]; then
-    # Codecs are mostly single-threaded per encode; metrics use minimal cores.
-    # Aim for nproc-2 in-box parallel chunks (saturate nearly all cores).
-    nc=$(nproc 2>/dev/null || echo 8)
-    PARALLEL=$(( nc > 6 ? nc - 2 : 2 ))
+    # `nproc` inside a vast.ai container reports the HOST's CPU count
+    # (often 56) not the container's actual cgroup allocation (usually
+    # 8-16). Read the cgroup limit so we don't oversubscribe and thrash.
+    cores_from_cgroup() {
+        # cgroup v2: cpu.max is "<quota_us> <period_us>" or "max <period>"
+        if [[ -r /sys/fs/cgroup/cpu.max ]]; then
+            read q p < /sys/fs/cgroup/cpu.max
+            [[ "$q" == "max" || -z "$q" ]] && return 1
+            echo $(( (q + p / 2) / p )); return 0
+        fi
+        # cgroup v1
+        if [[ -r /sys/fs/cgroup/cpu/cpu.cfs_quota_us && -r /sys/fs/cgroup/cpu/cpu.cfs_period_us ]]; then
+            local q p
+            q=$(cat /sys/fs/cgroup/cpu/cpu.cfs_quota_us)
+            p=$(cat /sys/fs/cgroup/cpu/cpu.cfs_period_us)
+            (( q > 0 && p > 0 )) && { echo $(( (q + p / 2) / p )); return 0; }
+        fi
+        return 1
+    }
+    ram_gb_from_cgroup() {
+        if [[ -r /sys/fs/cgroup/memory.max ]]; then
+            local m; m=$(cat /sys/fs/cgroup/memory.max)
+            [[ "$m" == "max" ]] && return 1
+            echo $(( m / 1024 / 1024 / 1024 )); return 0
+        fi
+        if [[ -r /sys/fs/cgroup/memory/memory.limit_in_bytes ]]; then
+            local m; m=$(cat /sys/fs/cgroup/memory/memory.limit_in_bytes)
+            (( m > 0 && m < 1099511627776 )) && { echo $(( m / 1024 / 1024 / 1024 )); return 0; }
+        fi
+        return 1
+    }
+    nc=$(cores_from_cgroup) || nc=$(nproc 2>/dev/null || echo 8)
+    # RAM-based cap: each parallel slot needs ~1.5 GB peak (encoder + 3 metrics).
+    # If RAM is tighter than CPU, RAM wins.
+    if rg=$(ram_gb_from_cgroup); then
+        ram_slots=$(( rg * 2 / 3 ))  # 1.5 GB / slot
+        (( ram_slots < nc )) && nc=$ram_slots
+    fi
+    PARALLEL=$(( nc > 6 ? nc - 2 : (nc > 2 ? nc - 1 : 2) ))
 fi
 
 log() { printf '[onstart-v3 %s %s] %s\n' "$(date -u +%H:%M:%S)" "$WORKER_ID" "$*"; }
